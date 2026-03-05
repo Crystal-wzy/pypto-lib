@@ -8,5 +8,6 @@ __pycache__/
 dist/
 build/
 build_output/
+pa_build/
 .DS_Store
 .cursor/
