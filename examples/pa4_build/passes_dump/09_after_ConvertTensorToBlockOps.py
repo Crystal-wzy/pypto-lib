@@ -162,6 +162,11 @@ class PagedAttentionProgram:
                 out_iter_1_outer_l3_rv: pl.Tensor[[4096, 128], pl.FP32] = pl.yield_(out_6)
             out_iter_1_outer_l2_rv: pl.Tensor[[4096, 128], pl.FP32] = pl.yield_(out_iter_1_outer_l3_rv)
         return out_iter_1_outer_l2_rv
-    @pl.function_group(aic="paged_attention_incore_0_aic", aiv="paged_attention_incore_0_aiv")
+    @pl.function_group(aic="paged_attention_incore_0_aic", aiv="paged_attention_incore_0_aiv", aiv_runtime_params=["AIV_IDX"])
     class paged_attention_incore_0_group:
+        """Parameter passing:
+          call_group(paged_attention_incore_0_group, b_idx_0_out, block_table_0, context_lens_0, key_cache_0, out_0, out_iter_1_outer_l0, out_iter_1_outer_l1, q_idx_0_out, query_0, value_cache_0)
+            → paged_attention_incore_0_aic(b_idx_0_out, block_table_0, context_lens_0, key_cache_0, out_0, out_iter_1_outer_l0, out_iter_1_outer_l1, q_idx_0_out, query_0, value_cache_0)
+            → paged_attention_incore_0_aiv(b_idx_0_out, block_table_0, context_lens_0, key_cache_0, out_0, out_iter_1_outer_l0, out_iter_1_outer_l1, q_idx_0_out, query_0, value_cache_0, AIV_IDX=<runtime>)
+        """
         pass
