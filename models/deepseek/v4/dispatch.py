@@ -86,7 +86,8 @@ def dispatch(
 
 W_PAD = 8  # FP32 scale/weight tile pad (32B min tile)
 IDX_PAD = 8  # INT32 r_route tile pad
-X_STAGE_ROWS = 8  # recv_x widen/stage chunk rows (8 x D FP16 = 64KB UB tile)
+X_STAGE_ROWS = 8  # recv_x stage chunk rows (8 x D INT8 = 32KB UB tile)
+N_ROUTES = T * TOPK
 
 
 @pl.jit.inline
@@ -102,11 +103,8 @@ def dispatch_ep(
     recv_count_out: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     pub_counts: pld.DistributedTensor[[EP_WORLD_SIZE * EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     count_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
-    # ``recv_x`` is widened to FP16 to work around a b8 SDMA bug on a2a3 (INT8
-    # cross-rank push lands stale on the peer; b16 is fine, and FP16 <-> INT8 is
-    # a lossless round-trip). ``recv_x_out`` stays INT8 — the narrow cast
-    # happens in stage_out.
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.FP16],
+    data_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_w: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_r_route: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, IDX_PAD], pl.INT32],
@@ -115,10 +113,6 @@ def dispatch_ep(
     # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
     # so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    # FP16 widen scratch for the b8 SDMA workaround; allocated outside the
-    # InCore scope (InCore cannot create GM tensors) and written in full by the
-    # widen loop before any read, pinning it against MemoryReuse.
-    x_fp16 = pl.create_tensor([T, D], dtype=pl.FP16)
 
     # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
     # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
@@ -143,19 +137,22 @@ def dispatch_ep(
                 for e in pl.range(N_LOCAL_EXPERTS):
                     v = send_counts[d * N_LOCAL_EXPERTS + e]
                     if v != 0:
-                        # Single-writer cell (each (src, d, e) is touched by
-                        # exactly src=my_rank), so Set is sufficient.
+                        # AtomicAdd to mirror the L3 reference protocol; the
+                        # cell is single-writer so Add and Set are equivalent
+                        # in value, but Add avoids TNOTIFY ordering pitfalls.
                         pld.system.notify(
                             target=pub_counts,
                             peer=peer,
                             offsets=[my_rank * EP_WORLD_SIZE + d, e],
                             value=v,
-                            op=pld.NotifyOp.Set,
+                            op=pld.NotifyOp.AtomicAdd,
                         )
 
         # ---------- count_done barrier ----------
-        # First notify on this per-src cell; Set since only my_rank writes
-        # offsets=[my_rank, 0] on each peer.
+        # AtomicAdd, NOT Set: the same per-src cell is bumped again by the data
+        # phase below. A Set here can race with a faster peer's data-phase add
+        # (count Set lands after, overwrites 2 -> 1) and deadlock the data wait
+        # at world sizes > 2.
         for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
@@ -163,7 +160,7 @@ def dispatch_ep(
                     peer=peer,
                     offsets=[my_rank, 0],
                     value=1,
-                    op=pld.NotifyOp.Set,
+                    op=pld.NotifyOp.AtomicAdd,
                 )
         for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
@@ -191,22 +188,14 @@ def dispatch_ep(
             pl.write(recv_count_out, [e, 0], acc)
 
         # ---------- payload_push: 4 channels per (t, k) ----------
-        # Widen x INT8 -> FP16 once per token (b8 SDMA workaround, see recv_x
-        # above) into the x_fp16 GM scratch; the per-route x push is then a
-        # GM-to-peer-GM TPUT with no per-route UB staging.
-        for c0 in pl.range(0, T, X_STAGE_ROWS):
-            x_wide = pl.cast(x_norm_i8[c0:c0 + X_STAGE_ROWS, :], target_type=pl.FP16)
-            x_fp16[c0:c0 + X_STAGE_ROWS, :] = x_wide
-
         cursor = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
         for d in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
                 cursor[d * N_LOCAL_EXPERTS + e] = 0
 
-        # Pad tiles for the scalar channels — a TPUT needs a 32B-aligned (>=8
-        # FP32 col) transfer, so the 1-element scale/w/r_route channels keep the
-        # tile.write + remote_store form. Columns 1..PAD-1 stay 0; only column 0
-        # is overwritten per push and read by stage_out.
+        # Pad tiles, zero-initialised once; only column 0 is overwritten per
+        # push (UB tile + remote_store is the proven path for runtime-computed
+        # scalars — a GM pack table written by scalar pl.write corrupts).
         scale_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
         w_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
         idx_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
@@ -222,35 +211,28 @@ def dispatch_ep(
                 slot = slot_off + cur_val
                 row = loc_e * RECV_MAX + slot
                 cursor[bucket] = cur_val + 1
-                r_route = pl.cast(t * TOPK + k, pl.INT32)
+                r_route = t * TOPK + k
 
                 pld.tensor.put(
                     dst=recv_x,
                     peer=dst,
-                    src=x_fp16,
+                    src=x_norm_i8,
                     dst_offsets=[row, 0],
                     src_offsets=[t, 0],
                     shape=[1, D],
                 )
-
-                s_val = pl.read(x_norm_scale, [t, 0])
-                pl.tile.write(scale_tile, [0, 0], s_val)
+                pl.tile.write(scale_tile, [0, 0], pl.read(x_norm_scale, [t, 0]))
                 pld.tile.remote_store(scale_tile, target=recv_scale, peer=dst, offsets=[row, 0])
-
-                w_val = pl.read(weights, [t, k])
-                pl.tile.write(w_tile, [0, 0], w_val)
+                pl.tile.write(w_tile, [0, 0], pl.read(weights, [t, k]))
                 pld.tile.remote_store(w_tile, target=recv_w, peer=dst, offsets=[row, 0])
-
-                pl.tile.write(idx_tile, [0, 0], r_route)
+                pl.tile.write(idx_tile, [0, 0], pl.cast(r_route, pl.INT32))
                 pld.tile.remote_store(idx_tile, target=recv_r_route, peer=dst, offsets=[row, 0])
 
-        # ---------- data_done barrier ----------
-        # Reuse count_done signal cells: count phase bumps to 1, data phase bumps to
-        # 2 (per-src cumulative count via AtomicAdd). Avoids a separate window.
+        # ---------- data_done barrier — per-src signal cells ----------
         for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
-                    target=count_done,
+                    target=data_done,
                     peer=peer,
                     offsets=[my_rank, 0],
                     value=1,
@@ -259,22 +241,21 @@ def dispatch_ep(
         for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
                 pld.system.wait(
-                    signal=count_done,
+                    signal=data_done,
                     offsets=[src, 0],
-                    expected=2,
+                    expected=1,
                     cmp=pld.WaitCmp.Ge,
                 )
 
         # stage_out: copy the windows the push filled into the host outputs.
-        # recv_x: FP16 window -> INT8 in X_STAGE_ROWS-row chunks through the
+        # recv_x: INT8 window copied in X_STAGE_ROWS-row chunks through the
         # flat view (per-row copies cost ~16x more MTE transfers).
         for row in pl.range(0, N_LOCAL_EXPERTS * RECV_MAX, X_STAGE_ROWS):
-            stage_x_i8 = pl.cast(recv_x[row:row + X_STAGE_ROWS, :], target_type=pl.INT8)
-            recv_x_out_flat[row:row + X_STAGE_ROWS, :] = stage_x_i8
+            recv_x_out_flat[row:row + X_STAGE_ROWS, :] = recv_x[row:row + X_STAGE_ROWS, :]
 
-        # recv_scale / recv_w / recv_r_route: scalar copy of window column 0,
-        # bounded to the valid rows (downstream consumers are count-bounded, so
-        # tail slots carry no contract).
+        # scale / w / r_route: scalar copy of window column 0, bounded to the
+        # valid rows (downstream consumers are count-bounded, so tail slots
+        # carry no contract).
         # WORKAROUND pypto#1693: writing these via tile pl.store made them
         # add_inout and the orchestration scrambled their post-write SSA aliases;
         # scalar pl.write keeps them add_output.
