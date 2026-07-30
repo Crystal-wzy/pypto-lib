@@ -493,6 +493,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
                 name, [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], cache_dtype,
                 init_value=init_kv_cache,
                 is_output=True,
+                resident="stacked",
             )
             specs.append(cache_spec)
         elif name == "ori_block_table":
@@ -525,6 +526,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
     lm_head_spec = TensorSpec(
         "lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16,
         init_value=init_lm_head_weight,
+        resident="stacked",
     )
     specs.append(lm_head_spec)
     hidden_out_spec = TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True)
