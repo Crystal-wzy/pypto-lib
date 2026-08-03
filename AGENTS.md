@@ -1,7 +1,9 @@
 # PyPTO-Lib Codex Instructions
 
-This repository keeps AI project policy in `.claude/`. Treat `.claude/` as the
-authoritative source of truth; this file is only the Codex entrypoint.
+This repository keeps AI project policy and execution workflows in
+`.claude/`. Public technical guidance is canonical in `docs/`; skills should
+reference it rather than maintain a second copy. This file is only the Codex
+entrypoint.
 
 ## Read First
 
@@ -11,11 +13,11 @@ kernel behavior:
 - Read `.claude/CLAUDE.md`
 - Read task-relevant files in `.claude/rules/` when present
 - Follow `.claude/skills/*/SKILL.md` when the task matches a documented workflow
-- Read `docs/pypto-coding-style.md` before writing or modifying kernels
+- Read `docs/pypto-coding/pypto-coding-style.md` before writing or modifying kernels
 
 Task mapping:
 
-- Environment setup: `.claude/skills/setup_env/SKILL.md`
+- Environment setup: `.claude/skills/setup-env/SKILL.md`
 - Kernel style pass: `.claude/skills/fmt-coding-style/SKILL.md`
 - Precision debugging: `.claude/skills/bisect-precision/SKILL.md`
 - Performance profiling: `.claude/skills/incore-profiling/SKILL.md`
@@ -37,6 +39,8 @@ plugins:
 - Keep changes scoped to the requested kernel, model, test, or documentation area
 - Prefer existing project patterns and examples over new abstractions
 - Keep public documentation and examples aligned when behavior changes
+- Keep durable technical guidance in `docs/`; keep skills focused on
+  environment-aware execution, safety, and reporting
 - Do not commit generated build artifacts from `build_output/`
 - Treat credentials, local paths with usernames, and machine-specific state as
   off-limits unless the user explicitly asks for them
@@ -71,5 +75,5 @@ Every executable kernel or model script generally accepts
 - `golden/`: compile/run/validate harness against torch references
 - `tests/`: lint checks and golden harness unit tests
 - `docs/`: coding style, compile/runtime workflow, performance tuning,
-  precision tuning, and debugging references
-- `.claude/skills/`: task-specific workflows shared with Claude Code
+  validation, examples, models, precision tuning, and debugging references
+- `.claude/skills/`: task-specific execution workflows that reference `docs/`
