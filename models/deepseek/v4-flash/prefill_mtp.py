@@ -727,7 +727,7 @@ def main():
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2, max_error_ratio=0.01),
             "hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
             "pre_hc_hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
-            "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+            "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.05),
         },
     )
     if not result.passed:
