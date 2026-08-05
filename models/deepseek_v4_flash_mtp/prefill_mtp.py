@@ -87,6 +87,32 @@ MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
 LM_HEAD_COMM_EPOCH = 1
 
+# Static parameters to keep device-resident, sharded per MTP rank.  Every tensor
+# is laid out as ``[N_RANKS, *tail]`` and consumed as ``weight[r]`` on
+# ``device=r``, so ``resident="stacked"`` uploads shard ``r`` once to that card
+# and reuses it across validation, warmup, and timed rounds.  Dynamic activations,
+# request ids, and block/slot metadata deliberately remain per-call.
+# ``lm_head_weight`` is constructed separately below and is resident as well.
+RESIDENT_WEIGHT_NAMES = frozenset({
+    # MTP projection.
+    "enorm_w", "hnorm_w",
+    "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    # SWA attention and RoPE constants.
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    # MoE weights and the static token-to-expert lookup table.
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale",
+    "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+    "shared_w2", "shared_w2_scale",
+    # MTP HC head and final norm.
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+})
+
 
 @pl.jit(auto_scope=False)
 def mtp_prefill_fwd(
@@ -427,9 +453,21 @@ def _mtp_head_specs():
     ]
 
 
-def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
+def build_tensor_specs(
+    start_pos=0,
+    num_tokens=T,
+    ori_block_num=BLOCK_NUM,
+    output_mode="validate",
+):
     import torch
     from golden import ScalarSpec, TensorSpec
+
+    if output_mode not in ("validate", "device-resident"):
+        raise ValueError(
+            f"unsupported output_mode {output_mode!r}; expected 'validate' or 'device-resident'"
+        )
+    # Both modes use the same resident device buffers. ``main`` controls whether
+    # they are copied to host once for golden validation or remain device-only.
 
     base_tensor_specs = build_single_layer_tensor_specs(
         start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID,
@@ -523,22 +561,34 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
         else:
             specs.append(_ranked(base[name], torch))
 
+    # Keep static weights on their consuming cards.  Apply this after assembly
+    # so the policy is independent of which component builder produced a spec.
+    for spec in specs:
+        if spec.name in RESIDENT_WEIGHT_NAMES:
+            spec.resident = "stacked"
+
     lm_head_spec = TensorSpec(
         "lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16,
         init_value=init_lm_head_weight,
         resident="stacked",
     )
     specs.append(lm_head_spec)
-    hidden_out_spec = TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True)
+    hidden_out_spec = TensorSpec(
+        "hidden_out", [N_RANKS, T, D], torch.bfloat16,
+        is_output=True,
+        resident="stacked",
+    )
     specs.append(hidden_out_spec)
     pre_hc_hidden_spec = TensorSpec(
         "pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32,
         is_output=True,
+        resident="stacked",
     )
     specs.append(pre_hc_hidden_spec)
     logits_spec = TensorSpec(
         "logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32,
         is_output=True,
+        resident="stacked",
     )
     specs.append(logits_spec)
     row_indices_spec = TensorSpec(
@@ -691,12 +741,23 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=BLOCK_NUM)
+    parser.add_argument(
+        "--output-mode",
+        choices=("validate", "device-resident"),
+        default="validate",
+        help=(
+            "validate: copy outputs to host and run golden checks; "
+            "device-resident: keep hidden/pre-HC/logits on device and skip golden/readback"
+        ),
+    )
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+
+    print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
@@ -707,8 +768,9 @@ def main():
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
             ori_block_num=args.ori_block_num,
+            output_mode=args.output_mode,
         ),
-        golden_fn=golden_mtp_prefill_fwd,
+        golden_fn=golden_mtp_prefill_fwd if args.output_mode == "validate" else None,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         save_data=False,
