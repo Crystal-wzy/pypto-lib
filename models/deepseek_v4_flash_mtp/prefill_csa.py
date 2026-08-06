@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 packed prefill CSA attention.
-
-This module wires HC pre/post, ratio-4 compressor, indexer, sparse attention,
-and cache writeback for the compressed sparse attention path. Single-request
-the layer owns the per-request loop and feeds this op one
-contiguous run of <=T tokens.
-"""
+"""DeepSeek-V4 packed prefill CSA attention: HC pre/post, ratio-4 compressor, indexer, sparse attention, cache writeback."""
 
 import functools
 
@@ -38,7 +32,7 @@ from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
     CSA_STATE_MAX_BLOCKS,
-    _prefill_compressor_ratio4_with_completion,
+    compressor_ratio4,
     golden_prefill_compressor_ratio4,
 )
 from hc_post import golden_hc_post_prefill, hc_post_prefill
@@ -48,7 +42,6 @@ from prefill_indexer import (
     IDX_CACHE_MAX_BLOCKS,
     INDEXER_SCORE_CAP,
     INDEXER_TOPK_CAP,
-    _int8_quant_per_row as _idx_int8_quant_per_row,
     gen_shared_weight,
     golden_prefill_indexer_core,
     prefill_indexer,
@@ -67,11 +60,18 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     SPARSE_CMP_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
-    _quant_w_per_channel,
     golden_prefill_sparse_attn,
-    _prefill_sparse_attn_with_block_mask,
+    sparse_attn,
 )
 
+# Dynamic shape variables.
+ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
+MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
+INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+
+# model config
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
@@ -85,11 +85,9 @@ MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 COMPRESS_RATIO = 4
 START_POS = 0
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 IDX_HEAD_DIM = M.index_head_dim
 IDX_N_HEADS = M.index_n_heads
 IDX_TOPK = M.index_topk
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
@@ -103,29 +101,20 @@ MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
-ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
+
+# paged KV cache
 ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-CSA_TOPK_TOKEN_TILE = 2
-WRITEBACK_GUARD_TILE = 16
-
-
 SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
-
-MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
-IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
-MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
-INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+
+# tiling
+CSA_TOPK_TOKEN_TILE = 2
+
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
@@ -229,7 +218,7 @@ def prefill_attention_csa(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     compressor_completion = pl.array.create(1, pl.TASK_ID)
-    _prefill_compressor_ratio4_with_completion(
+    compressor_ratio4(
         x_normed, compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape,
         cmp_norm_w, freqs_cos, freqs_sin,
@@ -318,7 +307,7 @@ def prefill_attention_csa(
             )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    _prefill_sparse_attn_with_block_mask(
+    sparse_attn(
         q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table,
         cmp_topk_indices,
@@ -427,6 +416,8 @@ def golden_prefill_attention_csa(tensors):
     """Torch reference for token-major packed CSA with overlay compressor/indexer."""
     import torch
 
+    from utils import cache_row_from_table
+
     num_tokens = int(tensors["num_tokens"])
     x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
     x_hc_flat = x_hc_rect.view(T, HC_MULT, D)
@@ -521,14 +512,6 @@ def golden_prefill_attention_csa(tensors):
         if dst_row >= 0:
             kv_cache_flat[dst_row, :] = kv[t]
 
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
-
     def assemble_swa_indices():
         swa_idx = torch.full((T, WIN), -1, dtype=torch.int32)
         pos = tensors["position_ids"]
@@ -598,9 +581,14 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables
+    from utils import (
+        build_rope_tables,
+        cache_row_from_table,
+        int8_quant_per_row,
+        quant_w_per_channel,
+    )
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     # Single-request geometry: q_len = num_tokens (active prefix), context_len =
     # start_pos (absolute position base, a multiple of S=WIN under chunked prefill).
@@ -651,7 +639,7 @@ def build_tensor_specs(
     # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
     # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
     # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
-    # Mirrors decode_attention_csa.
+    # Mirrors decode_csa.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0519
     def init_hc_attn_scale():
@@ -683,7 +671,7 @@ def build_tensor_specs(
         return shared_freqs_sin.clone()
     # Quant-faithful CSA (ratio-4) main compressor fixtures (mean l8/l32 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_attention_csa / decode_compressor_ratio4.
+    # Mirrors decode_csa / decode_compressor_ratio4.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0245
     def init_cmp_wgate():
@@ -716,7 +704,7 @@ def build_tensor_specs(
         return h * (IDX_HEAD_DIM ** -0.5)
     # Quant-faithful indexer inner compressor fixtures (mean l8/l32 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_attention_csa / decode_indexer.
+    # Mirrors decode_csa / decode_indexer.
     def init_inner_wkv():
         return torch.randn(INNER_OUT_DIM, D) * 0.0293
     def init_inner_wgate():
@@ -763,7 +751,7 @@ def build_tensor_specs(
             row = cache_row_from_table(table, cmp_slot)
             if row >= 0:
                 hist_bf16 = ((torch.rand(IDX_HEAD_DIM,) - 0.5) * 0.05).to(torch.bfloat16)
-                hi8, hsc = _idx_int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
+                hi8, hsc = int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
                 c_flat[row] = hi8.view(IDX_HEAD_DIM)
                 s_flat[row] = hsc.view(1)
         _idx_hist["cache"] = cache_i8
@@ -820,13 +808,6 @@ def build_tensor_specs(
         for block in range(IDX_CACHE_MAX_BLOCKS):
             table[block] = block
         return table
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
     def init_position_ids():
         return token_pos()
     def init_cmp_slot_mapping():
@@ -865,7 +846,7 @@ def build_tensor_specs(
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel_local(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
+    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
     # Indexer Q up-proj + weights projection (mirrors the standalone prefill_indexer fixtures).
     idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
     idx_wq_b_i8 = idx_wq_b_i8_T.t().contiguous()
@@ -959,7 +940,7 @@ def valid_ratio_reldiff(
 ):
     """Relative-diff comparator restricted to the valid (active) token rows.
 
-    Mirrors decode_attention_csa's ``ratio_reldiff`` bar and prefill_layer's
+    Mirrors decode_csa's ``ratio_reldiff`` bar and prefill_layer's
     ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
     ``T`` rows but only the leading ``num_tokens`` participate in attention
     accuracy. The deterministic zero padding is sliced off so it cannot dilute

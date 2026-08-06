@@ -34,7 +34,7 @@ from prefill_compressor_ratio4 import (
     OUT_DIM as MAIN_OUT_DIM,
     build_tensor_specs as build_compressor_tensor_specs,
     golden_prefill_compressor_ratio4,
-    _prefill_compressor_ratio4_with_completion,
+    compressor_ratio4,
 )
 from prefill_cp_exchange import (
     INNER_STATE_DIM,
@@ -84,7 +84,7 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     ROPE_DIM,
     VALID_BLOCK_MASK_COLS,
-    _prefill_sparse_attn_math,
+    sparse_attn_math,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
@@ -95,7 +95,7 @@ from qkv_proj_rope import (
     qkv_proj_rope,
 )
 from rmsnorm import golden_rms_norm, rms_norm
-from rope_tables import build_deepseek_v4_rope_tables
+from utils import build_rope_tables
 
 # model config
 D = M.hidden_size
@@ -686,7 +686,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     csa_values["hc_attn_base"] = torch.randn(MIX_HC)
     csa_values["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
     csa_values["freqs_cos"], csa_values["freqs_sin"] = (
-        build_deepseek_v4_rope_tables(
+        build_rope_tables(
             M, COMPRESS_RATIO, dtype=torch.bfloat16
         )
     )
@@ -1082,7 +1082,7 @@ def _cp_csa_compress_pack_part(
         active_eff = pl.max(active, 1)
 
         main_completion = pl.array.create(1, pl.TASK_ID)
-        main_cache_written, main_state_written = _prefill_compressor_ratio4_with_completion(
+        main_cache_written, main_state_written = compressor_ratio4(
             x_leaf, main_state, main_state_block_table,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
             freqs_cos, freqs_sin,
@@ -2043,7 +2043,7 @@ def prefill_cp_csa_core(
         active = pl.read(overlay_active_flat, [tile, 1])
         attn_out_tile = pl.create_tensor([T, D], dtype=pl.BF16)
         y_tile = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
-        _prefill_sparse_attn_math(
+        sparse_attn_math(
             q_tile, sparse_tile, bias_tile, mask_tile,
             attn_sink, cos_tile, sin_tile,
             wo_a, wo_b, wo_b_scale,
@@ -2562,7 +2562,7 @@ def prefill_cp_csa_test(
 
 def golden_prefill_cp_csa(tensors):
     """Compose CP-CSA golden outputs in logical-segment commit order."""
-    from prefill_indexer import _int8_quant_per_row
+    from utils import int8_quant_per_row
 
     ctx = getattr(golden_prefill_cp_csa, "_ctx", None)
     if ctx is None:
@@ -2966,7 +2966,7 @@ def golden_prefill_cp_csa(tensors):
         weights = (
             norm_flat.float() @ tensors["idx_weights_proj"].float()
         ) * M.index_weights_scale
-        query_i8, query_scale = _int8_quant_per_row(
+        query_i8, query_scale = int8_quant_per_row(
             query.reshape(LOCAL_ROWS * IDX_N_HEADS, IDX_HEAD_DIM)
         )
         max_visible = min(

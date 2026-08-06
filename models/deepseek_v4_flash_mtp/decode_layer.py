@@ -18,7 +18,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from decode_attention_swa import (
+from decode_swa import (
     B,
     BLOCK_SIZE,
     D,
@@ -42,7 +42,7 @@ from decode_attention_swa import (
     build_tensor_specs as build_attention_tensor_specs,
     golden_attention_swa,
 )
-from decode_attention_hca import (
+from decode_hca import (
     CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -55,7 +55,7 @@ from decode_attention_hca import (
     build_tensor_specs as build_hca_tensor_specs,
     golden_attention_hca,
 )
-from decode_attention_csa import (
+from decode_csa import (
     CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
@@ -646,7 +646,7 @@ def _attention_kind_for_layer(layer_id):
 
 def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     import torch
-    from decode_metadata import block_table
+    from utils import block_table
     from golden import ScalarSpec, TensorSpec
 
     _validate_layer_id(layer_id)

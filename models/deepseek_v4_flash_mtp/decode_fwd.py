@@ -32,7 +32,7 @@ from rmsnorm import rms_norm
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind
 # spec builders directly from the leaf modules (no dependency on decode_layer).
 # Import order matches decode_layer: attention kinds, then config, then moe.
-from decode_attention_swa import (
+from decode_swa import (
     B,
     BLOCK_SIZE,
     D,
@@ -55,7 +55,7 @@ from decode_attention_swa import (
     attention_swa,
     build_tensor_specs as build_attention_tensor_specs,
 )
-from decode_attention_hca import (
+from decode_hca import (
     CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -67,7 +67,7 @@ from decode_attention_hca import (
     attention_hca,
     build_tensor_specs as build_hca_tensor_specs,
 )
-from decode_attention_csa import (
+from decode_csa import (
     CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
@@ -90,7 +90,7 @@ from decode_attention_csa import (
 )
 from config import DECODE_START_POS, FLASH as MODEL_CONFIG
 from decode_input_pack import VOCAB_DYN as EMBED_VOCAB_DYN, pack_x_hc
-from decode_metadata_device import N_CACHE_GROUPS, build_decode_metadata
+from decode_metadata import N_CACHE_GROUPS, build_decode_metadata
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -1161,7 +1161,7 @@ def make_forward_metadata_tensors(
     idx_block_num=CSA_IDX_CACHE_BLOCK_NUM,
 ):
     import torch
-    from decode_metadata import (
+    from utils import (
         block_table,
         compressed_slot_mapping,
         kv_seq_lens_from_starts,
@@ -1413,7 +1413,7 @@ def build_single_layer_tensor_specs(
     """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
     build_tensor_specs restacks across the 43 forward layers."""
     import torch
-    from decode_metadata import block_table
+    from utils import block_table
     from golden import ScalarSpec, TensorSpec
 
     _validate_layer_id(layer_id)

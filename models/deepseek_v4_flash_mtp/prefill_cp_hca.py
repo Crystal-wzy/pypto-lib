@@ -67,7 +67,7 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     ROPE_DIM,
     VALID_BLOCK_MASK_COLS,
-    _prefill_sparse_attn_math,
+    sparse_attn_math,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
@@ -78,7 +78,7 @@ from qkv_proj_rope import (
     qkv_proj_rope,
 )
 from rmsnorm import golden_rms_norm, rms_norm
-from rope_tables import build_deepseek_v4_rope_tables
+from utils import build_rope_tables
 
 # model config
 D = M.hidden_size
@@ -995,7 +995,7 @@ def prefill_cp_hca_core(
         y_tile = pl.create_tensor(
             [TAIL_ROWS, HC_MULT, D], dtype=pl.FP32, init_value=0.0
         )
-        _prefill_sparse_attn_math(
+        sparse_attn_math(
             q_tile, sparse_tile, bias_tile, mask_tile,
             attn_sink, cos_tile, sin_tile,
             wo_a, wo_b, wo_b_scale,
@@ -1524,7 +1524,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     hca_values["hc_attn_base"] = torch.randn(MIX_HC)
     hca_values["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
     hca_values["freqs_cos"], hca_values["freqs_sin"] = (
-        build_deepseek_v4_rope_tables(
+        build_rope_tables(
             M, COMPRESS_RATIO, dtype=torch.bfloat16
         )
     )

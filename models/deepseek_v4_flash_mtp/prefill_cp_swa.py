@@ -51,11 +51,11 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
-    _prefill_sparse_attn_math,
+    sparse_attn_math,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
-from rope_tables import build_deepseek_v4_rope_tables
+from utils import build_rope_tables
 
 # model config
 D = M.hidden_size
@@ -558,7 +558,7 @@ def prefill_cp_swa_core(
         active = pl.read(overlay_active_lengths, [part, part_tile, 1])
         attn_out_tile = pl.create_tensor([TAIL_ROWS, D], dtype=pl.BF16)
         y_tile = pl.create_tensor([TAIL_ROWS, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
-        _prefill_sparse_attn_math(
+        sparse_attn_math(
             q=q_tile, sparse_kv=sparse_kv_tile, sparse_bias=bias_tile, valid_block_mask=mask_tile,
             attn_sink=attn_sink, freqs_cos=cos_tile, freqs_sin=sin_tile,
             wo_a=wo_a, wo_b=wo_b, wo_b_scale=wo_b_scale,
@@ -750,7 +750,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     base["hc_attn_scale"] = torch.randn(3)
     base["hc_attn_base"] = torch.randn(MIX_HC)
     base["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
-    base["freqs_cos"], base["freqs_sin"] = build_deepseek_v4_rope_tables(
+    base["freqs_cos"], base["freqs_sin"] = build_rope_tables(
         M, 0, dtype=torch.bfloat16
     )
     max_pos = max(ctx["starts"][s] + ctx["lengths"][s] for s in range(2 * cp_size))
