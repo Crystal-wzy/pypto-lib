@@ -16,8 +16,10 @@ from config import (
     C4A_COMPRESSOR_BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     FP32_NEG_INF,
-    PREFILL_IDX_BLOCK_NUM,
-    PREFILL_IDX_MAX_BLOCKS,
+    IDX_CACHE_BLOCK_NUM,
+    IDX_CACHE_MAX_BLOCKS,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -34,8 +36,8 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.index_nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
-B = 1
-S = 128
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 START_POS = 0
 COMPRESS_RATIO = 4
@@ -43,7 +45,6 @@ OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
@@ -51,11 +52,12 @@ MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
-IDX_CACHE_MAX_BLOCKS = PREFILL_IDX_MAX_BLOCKS
+IDX_CACHE_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
 
 # tiling
 K_TILE = 512                 # projection D (K) reduction tile
 OUT_TILE = 64                # projection OUT_DIM (N) tile
+PROJ_ROW_TILE = min(128, T)  # projection token-row tile; Acc = ROW*OUT_TILE*4 sits under the a2a3 L0C wall
 HEAD_D_TILE = 128            # head-dim tile for the softmax pool
 HEAD_TILE = 64
 PACKED_RMS_TILE = 16
@@ -97,13 +99,16 @@ def _prefill_indexer_compressor_with_completion(
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
     final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_idx_c4_kv_score_proj"):
-        o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
+    proj_row_blocks = T // PROJ_ROW_TILE
+    for proj_idx in pl.spmd((OUT_DIM // OUT_TILE) * proj_row_blocks, name_hint="prefill_idx_c4_kv_score_proj"):
+        proj_n = proj_idx // proj_row_blocks
+        o0 = proj_n * OUT_TILE
+        t0 = (proj_idx - proj_n * proj_row_blocks) * PROJ_ROW_TILE
+        kv_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+        score_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x[0:T, k0 : k0 + K_TILE]
+            x_tile = x[t0 : t0 + PROJ_ROW_TILE, k0 : k0 + K_TILE]
             # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load
             # (K-contiguous long bursts) instead of ND2NZ strided; mirrors the main
             # compressor (prefill_compressor_ratio4) and the decode indexer compressor.
@@ -115,8 +120,8 @@ def _prefill_indexer_compressor_with_completion(
             else:
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
-        score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
+        kv_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = kv_acc
+        score_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     # Precompute write_i -> (position, dst cache row) once. Input-only deps, so it overlaps the
     # projection matmul, replacing the O(T) write-discovery scan repeated in pool / rmsnorm_rope /
@@ -683,17 +688,16 @@ def build_tensor_specs(start_pos: int = START_POS):
             if row >= 0:
                 flat[row] = (torch.rand(COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
-    # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_indexer_compressor.
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the CSA inner / indexer compressor). Mirrors decode_indexer_compressor.
     def init_wkv():
-        return torch.randn(OUT_DIM, D) * 0.0293
+        return torch.randn(OUT_DIM, D) * 0.0270
     def init_wgate():
-        return torch.randn(OUT_DIM, D) * 0.0512
+        return torch.randn(OUT_DIM, D) * 0.0513
     def init_ape():
-        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1524
     def init_norm_w():
-        return 0.6850 + 0.2610 * torch.randn(HEAD_DIM)
+        return 0.6903 + 0.2663 * torch.randn(HEAD_DIM)
     def init_freqs_cos():
         return shared_freqs_cos.clone()
     def init_freqs_sin():
@@ -704,9 +708,9 @@ def build_tensor_specs(start_pos: int = START_POS):
             h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
         return (h * (HEAD_DIM ** -0.5)).to(torch.bfloat16)
     def init_idx_kv_cache():
-        return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
+        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
     def init_idx_kv_scale():
-        return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
     def init_idx_block_table():
         table = torch.full((IDX_CACHE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(IDX_CACHE_MAX_BLOCKS):
@@ -731,7 +735,7 @@ def build_tensor_specs(start_pos: int = START_POS):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = idx_row((pos + 1) // COMPRESS_RATIO - 1)
-                if dst_row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+                if dst_row >= IDX_CACHE_BLOCK_NUM * BLOCK_SIZE:
                     raise ValueError("fixture compressed slot exceeds standalone idx_kv_cache capacity")
                 mapping[t] = dst_row
         return mapping
@@ -753,8 +757,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
-        TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         ScalarSpec("num_tokens", torch.int32, T),
@@ -768,15 +772,10 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer compressor validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False,
+                        help="Compile/codegen only; also the implicit behavior on the *sim platforms CI uses.")
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)

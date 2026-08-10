@@ -23,11 +23,11 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
-    DECODE_CMP_BLOCK_NUM,
-    DECODE_ORI_BLOCK_NUM,
+    KV_CMP_BLOCK_NUM,
+    KV_ORI_BLOCK_NUM,
+    HCA_STATE_PHYSICAL_BLOCKS,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
-    KV_ORI_TABLE_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -73,15 +73,14 @@ OVERLAP = COMPRESS_RATIO == 4   # always False for HCA
 COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
-ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
-ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 # Main compressor state pool (kv + score channels merged into one paged FP32 buffer).
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
-COMPRESS_STATE_PHYSICAL_BLOCKS = 64
+COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
@@ -549,17 +548,16 @@ def build_tensor_specs(start_pos=None, batch=B):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
-    # Main compressor fixtures calibrated to the real DeepSeek-V4-Flash HCA layers
-    # (mean l7/l9 of extract_weights_flash): clean zero-mean Gaussian BF16 weights at the
-    # measured std; the RMSNorm gamma centers near a measured mean (not ones).
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 7/9 (the ratio-128 HCA main compressor).
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0246
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0240
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0316
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0309
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0340
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0332
     def init_cmp_norm_w():
-        return 0.1001 + 0.0549 * torch.randn(HEAD_DIM)
+        return 0.0982 + 0.0539 * torch.randn(HEAD_DIM)
     def init_compress_state():
         return torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
     def init_compress_state_block_table():
@@ -574,13 +572,13 @@ def build_tensor_specs(start_pos=None, batch=B):
         return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_window_block_table():
-        return block_table(batch=batch, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_cmp_block_table():
         return block_table(
             batch=batch,
             table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
         )
 
     def init_attn_sink():

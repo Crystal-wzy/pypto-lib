@@ -21,7 +21,7 @@ from config import (
     TP,
     DECODE_SEQ,
     BLOCK_SIZE,
-    DECODE_ORI_BLOCK_NUM,
+    KV_ORI_BLOCK_NUM,
     KV_ORI_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
@@ -53,7 +53,7 @@ NEG_INF = -1.0e20
 
 # paged KV cache
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
-ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 
 # tiling
 GATHER_SPLITS = 4
@@ -122,7 +122,7 @@ def sparse_attn_swa(
     proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     # SWA metadata already lowered each logical window row to a physical cache
     # slot. Current decode tokens must be inserted into ori_kv by the caller
-    # before this function runs; there is no MTP overlay path here.
+    # before this function runs; there is no speculative overlay path here.
 
     swa_kv_flat = pl.create_tensor([t_win, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)

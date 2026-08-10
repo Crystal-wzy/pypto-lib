@@ -23,7 +23,8 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
-    DECODE_CMP_BLOCK_NUM,
+    CSA_STATE_PHYSICAL_BLOCKS,
+    KV_CMP_BLOCK_NUM,
     KV_CMP_MAX_BLOCKS,
     FP32_NEG_INF,
 )
@@ -53,13 +54,13 @@ OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 COMPRESS_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-COMPRESS_STATE_PHYSICAL_BLOCKS = 65
+COMPRESS_STATE_PHYSICAL_BLOCKS = CSA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
 # tiling
@@ -491,17 +492,16 @@ def build_tensor_specs(start_pos=None, batch=B):
             table_blocks=COMPRESS_STATE_MAX_BLOCKS,
             physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
         )
-    # Calibrated to the real DeepSeek-V4-Flash CSA (ratio-4) main compressor (mean l8/l32 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform).
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the ratio-4 CSA main compressor).
     def init_wkv():
-        return torch.randn(OUT_DIM, D) * 0.0245
+        return torch.randn(OUT_DIM, D) * 0.0240
     def init_wgate():
-        return torch.randn(OUT_DIM, D) * 0.0388
+        return torch.randn(OUT_DIM, D) * 0.0381
     def init_ape():
-        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1243
+        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1226
     def init_norm_w():
-        return 0.9666 + 0.1929 * torch.randn(HEAD_DIM)
+        return 0.9569 + 0.1916 * torch.randn(HEAD_DIM)
     def init_rope_positions():
         first_pos = init_position_ids().to(torch.int64)[:, 0]
         cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)

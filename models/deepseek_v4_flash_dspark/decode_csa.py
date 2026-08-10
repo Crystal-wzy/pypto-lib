@@ -36,13 +36,14 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
-    DECODE_CMP_BLOCK_NUM,
-    DECODE_IDX_BLOCK_NUM,
-    DECODE_ORI_BLOCK_NUM,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    CSA_STATE_PHYSICAL_BLOCKS,
+    KV_CMP_BLOCK_NUM,
+    IDX_CACHE_BLOCK_NUM,
+    KV_ORI_BLOCK_NUM,
     IDX_CACHE_MAX_BLOCKS,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
-    KV_ORI_TABLE_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -90,25 +91,24 @@ COFF = 1 + int(OVERLAP)
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-MAIN_STATE_PHYSICAL_BLOCKS = 65
+MAIN_STATE_PHYSICAL_BLOCKS = CSA_STATE_PHYSICAL_BLOCKS
 MAIN_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
 MAIN_STATE_BLOCK_NUM = MAIN_STATE_PHYSICAL_BLOCKS
 MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-INNER_STATE_PHYSICAL_BLOCKS = 65
+INNER_STATE_PHYSICAL_BLOCKS = CSA_INNER_STATE_PHYSICAL_BLOCKS
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM = INNER_STATE_PHYSICAL_BLOCKS
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
-IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
+IDX_CACHE_BLOCK_NUM = IDX_CACHE_BLOCK_NUM
 IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
-ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
-ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
 # tiling
@@ -624,21 +624,20 @@ def build_tensor_specs(start_pos=None, batch=B):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
-    # Compressor/indexer fixtures calibrated to the real DeepSeek-V4-Flash CSA layers
-    # (mean l8/l32 of extract_weights_flash). The BF16 weights are clean zero-mean Gaussian
-    # (no quant grid), so randn x measured-std is in-distribution; the RMSNorm gammas center
-    # near a measured mean (not ones); idx_wq_b is the only quantized one (see below).
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the CSA main and inner compressors). idx_wq_b is the only quantized
+    # one and goes through the MXFP8 grid below, not a randn INT8.
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0245
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0240
 
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0388
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0381
 
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1226
 
     def init_cmp_norm_w():
-        return 0.9666 + 0.1929 * torch.randn(HEAD_DIM)
+        return 0.9569 + 0.1916 * torch.randn(HEAD_DIM)
 
     def init_compress_state():
         state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
@@ -662,7 +661,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         )
 
     def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) * 0.2313
+        return torch.randn(D, IDX_N_HEADS) * 0.2218
 
     def init_hadamard_idx():
         h = torch.ones((1, 1))
@@ -674,16 +673,16 @@ def build_tensor_specs(start_pos=None, batch=B):
         return h / (IDX_HEAD_DIM ** 0.5)
 
     def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+        return torch.randn(INNER_OUT_DIM, D) * 0.0270
 
     def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+        return torch.randn(INNER_OUT_DIM, D) * 0.0513
 
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1524
 
     def init_inner_norm_w():
-        return 0.6850 + 0.2610 * torch.randn(IDX_HEAD_DIM)
+        return 0.6903 + 0.2663 * torch.randn(IDX_HEAD_DIM)
 
     def init_inner_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
@@ -710,7 +709,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_window_block_table():
-        return block_table(batch=batch, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+        return block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
 
     def init_cmp_kv():
         return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
@@ -719,7 +718,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         return block_table(
             batch=batch,
             table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
         )
 
     def init_idx_kv_cache():
@@ -729,7 +728,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         return block_table(
             batch=batch,
             table_blocks=IDX_CACHE_MAX_BLOCKS,
-            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_BLOCK_NUM,
         )
 
     def init_attn_sink():

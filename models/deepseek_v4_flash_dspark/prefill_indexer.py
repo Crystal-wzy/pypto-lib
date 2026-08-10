@@ -18,7 +18,9 @@ from config import (
     IDX_CACHE_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
-    PREFILL_IDX_BLOCK_NUM,
+    IDX_CACHE_BLOCK_NUM,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
 )
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
@@ -51,14 +53,16 @@ INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
-B = 1
-S = 128
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 START_POS = 0
-# prefill_idx_score_out materializes [T, INDEXER_SCORE_CAP] in one Vec scope, so the
-# score output cap stays at 256 rows; the physical pool is sized by PREFILL_IDX_BLOCK_NUM.
-INDEXER_SCORE_MAX_BLOCKS = 2
-INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
+# Scored compressed positions per token: this chunk plus one chunk of history, so
+# a --start-pos up to T still sees its compressed rows. Past the cap the visible
+# set is clamped and the tail dropped, with no compile or runtime diagnostic --
+# prefill_csa asserts the reach against its start_pos. The physical pool is sized
+# by IDX_CACHE_BLOCK_NUM.
+INDEXER_SCORE_CAP = 2 * max(1, T // COMPRESS_RATIO)
 INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 # CP selector widths.
@@ -74,6 +78,7 @@ SCORE_TOKEN_TILE = 8
 TOPK_TILE = 4
 Q_TILE = 128
 Q_OUT_TILE = 256
+QR_PROJ_MM_ROW_TILE = min(128, T)     # qr_proj token-row tile; Acc = ROW*Q_OUT_TILE*4 sits on the a2a3 L0C wall
 QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
 D_TILE = 32
@@ -94,6 +99,7 @@ SORT_LEN = 2048
 PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
 TOPK_PAIR_WIDTH = 2 * PREFILL_TOPK_CAP
 SCORE_INIT_TILE = 16                   # rows per -inf init write; keeps [tile, SORT_LEN] under the Vec limit
+SCORE_OUT_ROW_TILE = 64                # rows per score copy-out; keeps [tile, INDEXER_SCORE_CAP] under the Vec limit
 
 # A misaligned topk prefix faults on device like a narrow sort.
 assert TOPK_PAIR_WIDTH > 0 and (TOPK_PAIR_WIDTH & (TOPK_PAIR_WIDTH - 1)) == 0
@@ -133,20 +139,25 @@ def prefill_indexer(
 ):
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_idx_qr_proj"):
-        o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+    qr_mm_row_blocks = T // QR_PROJ_MM_ROW_TILE
+    qr_proj_blocks = (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE) * qr_mm_row_blocks
+    for idx in pl.spmd(qr_proj_blocks, name_hint="prefill_idx_qr_proj"):
+        qr_n = idx // qr_mm_row_blocks
+        o0 = qr_n * Q_OUT_TILE
+        mm_t0 = (idx - qr_n * qr_mm_row_blocks) * QR_PROJ_MM_ROW_TILE
+        qr_acc = pl.create_tensor([QR_PROJ_MM_ROW_TILE, Q_OUT_TILE], dtype=pl.INT32)
         for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
             q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
+            qr_tile = qr[mm_t0 : mm_t0 + QR_PROJ_MM_ROW_TILE, q0 : q0 + Q_TILE]
             wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
             if q0 == 0:
                 qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
             else:
                 qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
+        for rl in pl.range(0, QR_PROJ_MM_ROW_TILE, QR_PROJ_ROW_TILE):
+            r0 = mm_t0 + rl
+            acc_fp32 = pl.cast(qr_acc[rl : rl + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
             scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
             qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
@@ -313,8 +324,10 @@ def prefill_indexer(
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
     score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
-        score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
+    for out_idx in pl.spmd(T // SCORE_OUT_ROW_TILE, name_hint="prefill_idx_score_out"):
+        out_t0 = out_idx * SCORE_OUT_ROW_TILE
+        score_out_rows = score_wide[out_t0 : out_t0 + SCORE_OUT_ROW_TILE, 0:INDEXER_SCORE_CAP]
+        score_out_flat[out_t0 : out_t0 + SCORE_OUT_ROW_TILE, :] = score_out_rows
 
     # === top-k per token over the visible (causally reachable) compressed positions ===
     for topk_idx in pl.spmd(T // TOPK_TILE, name_hint="prefill_idx_topk"):
@@ -671,8 +684,8 @@ def golden_prefill_indexer_core(tensors):
 
     # C8: the compressor already stored INT8 KV + a per-position dequant scale. Gather both in
     # compressed-position order through the paged block table (no score-time re-quant).
-    cache_flat_i8 = tensors["idx_kv_cache"].reshape(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
-    scale_flat = tensors["idx_kv_scale"].float().reshape(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
+    cache_flat_i8 = tensors["idx_kv_cache"].reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+    scale_flat = tensors["idx_kv_scale"].float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1)
     idx_block_table = tensors["idx_block_table"]
     rows = [
         int(idx_block_table[c // BLOCK_SIZE].item()) * BLOCK_SIZE + (c % BLOCK_SIZE)
@@ -843,31 +856,30 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
             if row >= 0:
                 flat[row] = (torch.rand(INNER_COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
-    # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_indexer.
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the CSA inner / indexer compressor). Mirrors decode_indexer.
     def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+        return torch.randn(INNER_OUT_DIM, D) * 0.0270
     def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+        return torch.randn(INNER_OUT_DIM, D) * 0.0513
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1524
     def init_inner_norm_w():
-        return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
+        return 0.6903 + 0.2663 * torch.randn(INNER_HEAD_DIM)
     # C8 historical index cache: completed compressed slots hold INT8 + a per-position dequant scale.
     # Build both from one bf16-rounded random draw so cache and scale stay consistent.
     _idx_hist = {}
     def _build_idx_hist():
         if "cache" in _idx_hist:
             return
-        cache_i8 = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
-        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
-        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
-        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
+        cache_i8 = torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
+        scale = torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        c_flat = cache_i8.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+        s_flat = scale.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1)
         completed = start_pos // COMPRESS_RATIO
         for cmp_slot in range(completed):
             row = idx_row(cmp_slot)
-            if row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+            if row >= IDX_CACHE_BLOCK_NUM * BLOCK_SIZE:
                 raise ValueError("fixture historical compressed slot exceeds standalone idx_kv_cache capacity")
             if row >= 0:
                 hist_bf16 = ((torch.rand(IDX_HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
@@ -903,7 +915,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = idx_row((pos + 1) // COMPRESS_RATIO - 1)
-                if dst_row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+                if dst_row >= IDX_CACHE_BLOCK_NUM * BLOCK_SIZE:
                     raise ValueError("fixture compressed slot exceeds standalone idx_kv_cache capacity")
                 mapping[t] = dst_row
         return mapping
@@ -913,8 +925,8 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
             mapping[t] = state_row(start_pos + t)
         return mapping
     def init_weights_proj():
-        # weights_proj calibrated to the real DeepSeek-V4-Flash indexer weights projection.
-        return torch.randn(D, IDX_N_HEADS) * 0.2313
+        # weights_proj std, averaged over DeepSeek-V4-Flash-0731 layers 8/32.
+        return torch.randn(D, IDX_N_HEADS) * 0.2218
     def init_cos():
         return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_position_ids().to(torch.int64))[0]
     def init_sin():
@@ -944,8 +956,8 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
-        TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("score", [T, INDEXER_SCORE_CAP], torch.float32, is_output=True),
         TensorSpec("topk_idxs", [T, INDEXER_SCORE_CAP], torch.int32, is_output=True),
@@ -962,15 +974,10 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False,
+                        help="Compile/codegen only; also the implicit behavior on the *sim platforms CI uses.")
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
     parser.add_argument("--num-tokens", type=int, default=T,
