@@ -62,7 +62,7 @@ from moe import (
     golden_moe,
     moe,
 )
-from config import PRO_KERNEL as MODEL_CONFIG
+from config import ACTIVE as MODEL_CONFIG
 from prefill_attention_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
     BLOCK_SIZE as SWA_BLOCK_SIZE,

@@ -7,8 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
-"""DeepSeek-V4 MoE single-layer (decode), PRO preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 48 experts."""
+"""DeepSeek-V4 MoE single-layer (decode).
+
+``--ep`` selects the 2/4/8-rank expert-parallel world. Each rank keeps the
+architecture-specific expert shard: 48 experts for Pro or 32 for Flash.
+"""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
@@ -33,14 +36,20 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
-config.PRO_KERNEL = dataclasses.replace(config.PRO_KERNEL, n_routed_experts=config.PRO_KERNEL.n_routed_experts // 8 * EP)
+# Presets describe the EP8 deployment. Specialize from the immutable active
+# base so reloading this module cannot repeatedly shrink the expert dimension.
+config.ACTIVE = dataclasses.replace(
+    config.ACTIVE_BASE,
+    n_routed_experts=config.ACTIVE_BASE.n_routed_experts // 8 * EP,
+)
+config.PRO_KERNEL = config.ACTIVE  # compatibility for out-of-tree imports
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import PRO_KERNEL as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
+from config import ACTIVE as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
 from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate

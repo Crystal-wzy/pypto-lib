@@ -19,6 +19,12 @@ import pypto.language.distributed as pld
 from golden import mapped_pool_ratio_allclose
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
+from decode_attention_swa import (
+    WIN as SWA_WIN,
+    attention_swa,
+    build_tensor_specs as build_swa_tensor_specs,
+    golden_attention_swa,
+)
 from decode_attention_hca import (
     B,
     BLOCK_SIZE,
@@ -73,7 +79,7 @@ from decode_attention_csa import (
     build_tensor_specs as build_csa_tensor_specs,
     golden_attention_csa,
 )
-from config import DECODE_START_POS, PRO_KERNEL as MODEL_CONFIG
+from config import ACTIVE as MODEL_CONFIG, DECODE_START_POS
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -92,6 +98,7 @@ from moe import (
 
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
+assert SWA_WIN == WINDOW_WIN, "SWA/HCA/CSA metadata must share one sliding-window size"
 
 # ---- layer schedule (derived from the active preset; never hard-coded) ----
 # ``compress_ratios`` holds ``num_hidden_layers + 1`` entries; the trailing entry
@@ -99,7 +106,7 @@ assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_
 HIDDEN_RATIOS = tuple(MODEL_CONFIG.compress_ratios[: MODEL_CONFIG.num_hidden_layers])
 # Steady state starts at the first ratio-4 layer and alternates from there:
 # even ids -> CSA (ratio 4), odd ids -> HCA (ratio 128). Layers below ALT_START
-# form a leading block that shares one ratio (Pro: 128/HCA).
+# form a leading block that shares one ratio (Flash: 0/SWA; Pro: 128/HCA).
 ALT_START = HIDDEN_RATIOS.index(4)
 LEAD_RATIO = HIDDEN_RATIOS[0]
 assert all(r == LEAD_RATIO for r in HIDDEN_RATIOS[:ALT_START]), \
@@ -107,12 +114,9 @@ assert all(r == LEAD_RATIO for r in HIDDEN_RATIOS[:ALT_START]), \
 assert all(r == (4 if i % 2 == ALT_START % 2 else 128)
            for i, r in enumerate(HIDDEN_RATIOS[ALT_START:], start=ALT_START)), \
     f"{MODEL_CONFIG.name}: steady-state layers must alternate CSA(even)/HCA(odd)"
-# Pro has no ratio-0 hidden layer -- layers 0/1 are HCA where Flash used SWA --
-# so this kernel lowers only the HCA and CSA paths. The one ratio-0 entry left
-# in the preset is the MTP layer, handled by decode_mtp.py.
-assert LEAD_RATIO == 128 and 0 not in HIDDEN_RATIOS, \
-    (f"{MODEL_CONFIG.name}: decode_layer lowers HCA(128)/CSA(4) only, got "
-     f"ratios {sorted(set(HIDDEN_RATIOS))}")
+assert LEAD_RATIO in (0, 128), \
+    (f"{MODEL_CONFIG.name}: leading layers must be SWA(0) or HCA(128), got "
+     f"{LEAD_RATIO}")
 
 
 @pl.jit
@@ -135,6 +139,9 @@ def decode_layer(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     window_swa_indices: pl.Tensor[[T, WINDOW_WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[T], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[T], pl.INT64],
+    swa_indices: pl.Tensor[[T, SWA_WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -219,7 +226,34 @@ def decode_layer(
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    if layer_id % 2 == 1 or layer_id < ALT_START:
+    if layer_id < ALT_START:
+        if LEAD_RATIO == 0:
+            attention_swa(
+                x_hc,
+                hc_attn_fn, hc_attn_scale, hc_attn_base,
+                attn_norm_w, wq_a, wq_b, wq_b_scale,
+                wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
+                kv_cache,
+                swa_slot_mapping, swa_indices, swa_lens, position_ids,
+                attn_sink, wo_a, wo_b, wo_b_scale,
+                x_attn,
+            )
+        else:
+            attention_hca(
+                x_hc,
+                hc_attn_fn, hc_attn_scale, hc_attn_base,
+                attn_norm_w, wq_a, wq_b, wq_b_scale,
+                wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
+                hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
+                hca_compress_state, hca_compress_state_block_table,
+                kv_cache, cmp_kv, cmp_block_table,
+                ori_slot_mapping, window_swa_indices, window_swa_lens,
+                hca_cmp_slot_mapping, hca_state_slot_mapping,
+                position_ids, kv_seq_lens,
+                attn_sink, wo_a, wo_b, wo_b_scale,
+                x_attn,
+            )
+    elif layer_id % 2 != ALT_START % 2:
         attention_hca(
             x_hc,
             hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -292,6 +326,9 @@ def l3_decode_layer(
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     window_swa_indices: pl.Tensor[[N_RANKS, T, WINDOW_WIN], pl.INT32],
     window_swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    swa_indices: pl.Tensor[[N_RANKS, T, SWA_WIN], pl.INT32],
+    swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
@@ -395,6 +432,7 @@ def l3_decode_layer(
             kv_cache[r], block_table[r],
             ori_slot_mapping[r],
             window_swa_indices[r], window_swa_lens[r],
+            swa_slot_mapping[r], swa_indices[r], swa_lens[r],
             hca_cmp_slot_mapping[r], hca_state_slot_mapping[r],
             csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r],
             csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
@@ -420,6 +458,43 @@ def l3_decode_layer(
             layer_id, r,
             device=r,
         )
+
+
+def golden_decode_layer_swa(tensors):
+    import torch
+
+    x_attn = torch.empty_like(tensors["x_hc"])
+    for r in range(N_RANKS):
+        golden_attention_swa({
+            "x_hc": tensors["x_hc"][r],
+            "hc_attn_fn": tensors["hc_attn_fn"][r],
+            "hc_attn_scale": tensors["hc_attn_scale"][r],
+            "hc_attn_base": tensors["hc_attn_base"][r],
+            "attn_norm_w": tensors["attn_norm_w"][r],
+            "wq_a": tensors["wq_a"][r],
+            "wq_b": tensors["wq_b"][r],
+            "wq_b_scale": tensors["wq_b_scale"][r],
+            "wkv": tensors["wkv"][r],
+            "gamma_cq": tensors["gamma_cq"][r],
+            "gamma_ckv": tensors["gamma_ckv"][r],
+            "freqs_cos": tensors["freqs_cos"][r],
+            "freqs_sin": tensors["freqs_sin"][r],
+            "kv_cache": tensors["kv_cache"][r],
+            "swa_slot_mapping": tensors["swa_slot_mapping"][r],
+            "swa_indices": tensors["swa_indices"][r],
+            "swa_lens": tensors["swa_lens"][r],
+            "position_ids": tensors["position_ids"][r],
+            "attn_sink": tensors["attn_sink"][r],
+            "wo_a": tensors["wo_a"][r],
+            "wo_b": tensors["wo_b"][r],
+            "wo_b_scale": tensors["wo_b_scale"][r],
+            "x_out": x_attn[r],
+        })
+
+    moe_tensors = dict(tensors)
+    moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
+    golden_moe(moe_tensors)
 
 
 def golden_decode_layer_hca(tensors):
@@ -535,7 +610,9 @@ def golden_decode_layer_csa(tensors):
 
 def golden_decode_layer_auto(tensors):
     attention_mode = _attention_kind_for_layer(int(tensors["layer_id"]))
-    if attention_mode == "hca":
+    if attention_mode == "swa":
+        golden_decode_layer_swa(tensors)
+    elif attention_mode == "hca":
         mapped = dict(tensors)
         mapped.update({
             "cmp_wkv": tensors["hca_cmp_wkv"],
@@ -598,14 +675,13 @@ def _validate_layer_id(layer_id):
 def _attention_kind_for_layer(layer_id):
     _validate_layer_id(layer_id)
     ratio = MODEL_CONFIG.compress_ratios[layer_id]
+    if ratio == 0:
+        return "swa"
     if ratio == 128:
         return "hca"
     if ratio == 4:
         return "csa"
-    raise ValueError(
-        f"decode_layer lowers HCA(128)/CSA(4) only; layer_id={layer_id} has "
-        f"compress ratio {ratio} (ratio 0 / SWA lives in decode_mtp.py)"
-    )
+    raise ValueError(f"unsupported compress ratio {ratio} for layer_id={layer_id}")
 
 
 def _ratio_reldiff_with_abs_cap(
@@ -661,6 +737,11 @@ def build_tensor_specs(
 
     _validate_layer_id(layer_id)
 
+    swa_specs = {
+        spec.name: spec
+        for spec in build_swa_tensor_specs(start_pos)
+        if isinstance(spec, TensorSpec)
+    }
     hca_specs = {
         spec.name: spec
         for spec in build_hca_tensor_specs(start_pos)
@@ -675,14 +756,16 @@ def build_tensor_specs(
     moe_tensor_specs = {spec.name: spec for spec in moe_specs if isinstance(spec, TensorSpec)}
     attention_kind = _attention_kind_for_layer(layer_id)
     active_specs = {
+        "swa": swa_specs,
         "hca": hca_specs,
         "csa": csa_specs,
     }[attention_kind]
-    active_mutable_cache_names = {"kv_cache", "cmp_kv"}
+    active_mutable_cache_names = {"kv_cache"}
     if attention_kind == "hca":
-        active_mutable_cache_names.add("hca_compress_state")
-    else:
+        active_mutable_cache_names.update({"cmp_kv", "hca_compress_state"})
+    elif attention_kind == "csa":
         active_mutable_cache_names.update({
+            "cmp_kv",
             "idx_kv_cache",
             "idx_kv_scale",
             "csa_compress_state",
@@ -747,9 +830,12 @@ def build_tensor_specs(
         ("freqs_sin", active_specs["freqs_sin"]),
         ("kv_cache", active_specs["kv_cache"]),
         ("block_table", TensorSpec("block_table", [B, ORI_TABLE_MAX_BLOCKS], torch.int32, init_value=init_block_table)),
-        ("ori_slot_mapping", active_specs["ori_slot_mapping"]),
-        ("window_swa_indices", active_specs["window_swa_indices"]),
-        ("window_swa_lens", active_specs["window_swa_lens"]),
+        ("ori_slot_mapping", active_specs.get("ori_slot_mapping", hca_specs["ori_slot_mapping"])),
+        ("window_swa_indices", active_specs.get("window_swa_indices", hca_specs["window_swa_indices"])),
+        ("window_swa_lens", active_specs.get("window_swa_lens", hca_specs["window_swa_lens"])),
+        ("swa_slot_mapping", swa_specs["swa_slot_mapping"]),
+        ("swa_indices", swa_specs["swa_indices"]),
+        ("swa_lens", swa_specs["swa_lens"]),
         ("hca_cmp_slot_mapping", hca_specs["cmp_slot_mapping"]),
         ("hca_state_slot_mapping", hca_specs["state_slot_mapping"]),
         ("csa_cmp_slot_mapping", csa_specs["cmp_slot_mapping"]),
@@ -757,7 +843,7 @@ def build_tensor_specs(
         ("csa_state_slot_mapping", csa_specs["state_slot_mapping"]),
         ("csa_inner_state_slot_mapping", csa_specs["inner_state_slot_mapping"]),
         ("position_ids", active_specs["position_ids"]),
-        ("kv_seq_lens", active_specs["kv_seq_lens"]),
+        ("kv_seq_lens", active_specs.get("kv_seq_lens", hca_specs["kv_seq_lens"])),
         ("attn_sink", active_specs["attn_sink"]),
         ("wo_a", active_specs["wo_a"]),
         ("wo_b", active_specs["wo_b"]),
@@ -784,8 +870,8 @@ def build_tensor_specs(
         ("csa_inner_norm_w", csa_specs["inner_norm_w"]),
         ("csa_inner_compress_state", csa_specs["inner_compress_state"]),
         ("csa_inner_compress_state_block_table", csa_specs["inner_compress_state_block_table"]),
-        ("cmp_kv", active_specs["cmp_kv"]),
-        ("cmp_block_table", active_specs["cmp_block_table"]),
+        ("cmp_kv", active_specs.get("cmp_kv", hca_specs["cmp_kv"])),
+        ("cmp_block_table", active_specs.get("cmp_block_table", hca_specs["cmp_block_table"])),
         ("idx_kv_cache", csa_specs["idx_kv_cache"]),
         ("idx_kv_scale", csa_specs["idx_kv_scale"]),
         ("idx_block_table", csa_specs["idx_block_table"]),
@@ -898,7 +984,13 @@ if __name__ == "__main__":
     golden_fn = golden_decode_layer_auto
     golden_data = args.golden_data
     attention_kind = _attention_kind_for_layer(args.layer_id)
-    cmp_slot_mapping = f"{attention_kind}_cmp_slot_mapping"
+    kv_slot_mapping = "swa_slot_mapping" if attention_kind == "swa" else "ori_slot_mapping"
+    # SWA has no compressed cache, so this comparator is inactive for that
+    # branch; use an existing metadata name to keep comparator construction
+    # uniform across all three layer kinds.
+    cmp_slot_mapping = (
+        "hca_cmp_slot_mapping" if attention_kind == "hca" else "csa_cmp_slot_mapping"
+    )
     compare_fn = {
         # Pro EP2 measurements with branch-consistent fixtures place 5.5-6.7%
         # of the composed HCA/CSA output above 1e-2. Keep a small margin for
@@ -915,7 +1007,7 @@ if __name__ == "__main__":
         # checked for exact preservation, so a larger physical pool cannot hide
         # a broken write or an out-of-bounds mutation.
         "kv_cache": mapped_pool_ratio_allclose(
-            "ori_slot_mapping",
+            kv_slot_mapping,
             mapping_shape=(N_RANKS, T),
             block_size=BLOCK_SIZE,
             leading_rank_axis=True,

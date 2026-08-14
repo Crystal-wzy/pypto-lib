@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (
-    PRO_KERNEL as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
@@ -153,7 +153,7 @@ assert PA_NFRAGS % PA_NF_PER_BLOCK == 0, "proj_a N-frag loop must cover PA_NFRAG
 # a5 CSA decode case, paired interleaved A/B, 5 reps x 100 rounds: 715.6 -> 709.5us
 # (-6.1). 1024 (112 blocks) gave back the win (+0.4us) -- past 64 blocks the extra
 # matmul setups outweigh the finer fit.
-PROJ_B_D_CHUNK = 1792
+PROJ_B_D_CHUNK = 512 if M.name == "flash" else 1792
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # proj_b_act uses one block per 512-column output region, eight blocks in total.
 PROJ_B_ACT_T_TILE = 8    # inner token tile for the proj_b_act O_GROUPS-way INT32->FP32 accumulate

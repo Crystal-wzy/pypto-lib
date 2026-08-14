@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 # ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
-"""DeepSeek-V4 Pro decode forward experiment with looped CSA/HCA layers inside a pl.jit function."""
+"""DeepSeek-V4 Pro/Flash decode forward experiment."""
 # ruff: noqa: F403,F405
 
 import argparse
@@ -17,6 +17,16 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run_jit
 from hc_head import hc_head
+from input_pack import VOCAB_DYN as EMBED_VOCAB_DYN, pack_x_hc
+from lm_head import (
+    GROUP_LOGIT_ROWS,
+    MAX_LOGIT_ROWS,
+    SAMPLED_IDS_PAD,
+    TP_SIZE as LM_HEAD_TP_SIZE,
+    VOCAB as LM_HEAD_VOCAB,
+    VOCAB_PER_TP,
+    lm_head_with_sampling,
+)
 from pypto.ir.distributed_compiled_program import DistributedConfig
 from rmsnorm import rms_norm
 
@@ -43,6 +53,7 @@ from decode_attention_swa import (
     ROPE_HEAD_DIM,
     T,
     WIN as SWA_WIN,
+    attention_swa,
     build_tensor_specs as build_attention_tensor_specs,
 )
 from decode_attention_hca import (
@@ -78,7 +89,7 @@ from decode_attention_csa import (
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
 )
-from config import DECODE_START_POS, PRO_KERNEL as MODEL_CONFIG
+from config import ACTIVE as MODEL_CONFIG, ACTIVE_VARIANT, DECODE_START_POS, SUPPORTED_VARIANTS
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -103,24 +114,34 @@ assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_COMPRESS_RATIOS = MODEL_CONFIG.compress_ratios[:MODEL_NUM_LAYERS]
 FWD_NUM_LAYERS = MODEL_NUM_LAYERS
+SWA_COMPRESS_RATIO = 0
+SWA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(SWA_COMPRESS_RATIO)
 CSA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(CSA_COMPRESS_RATIO)
 HCA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(HCA_COMPRESS_RATIO)
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
+LM_HEAD_COMM_EPOCH = 1
 
 # Emission shape this body hand-unrolls: LEAD_NUM_LAYERS unrolled leading layers,
 # then (csa, hca) pairs from the pl.range loop, then one trailing csa layer.
 # Flash: lead = 2 swa, 20 pairs.  Pro: lead = 2 hca, 29 pairs.
 LEAD_NUM_LAYERS = 2
 PAIR_LOOP_COUNT = (FWD_NUM_LAYERS - LEAD_NUM_LAYERS - 1) // 2
+LEAD_COMPRESS_RATIO = FWD_COMPRESS_RATIOS[0]
 # hca-kind stack slot of the first *looped* hca layer: the leading layers consume
 # a slot each only when they are themselves hca (Pro: 2; Flash: 0, they were swa).
 HCA_LOOP_BASE = FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS].count(HCA_COMPRESS_RATIO)
 
-assert CSA_NUM_LAYERS + HCA_NUM_LAYERS == FWD_NUM_LAYERS, \
-    f"decode_fwd emits csa/hca layers only, got ratios {FWD_COMPRESS_RATIOS}"
-assert all(r == HCA_COMPRESS_RATIO for r in FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS]), \
-    f"decode_fwd unrolls the first {LEAD_NUM_LAYERS} layers as hca (ratio 128)"
+assert SWA_NUM_LAYERS + CSA_NUM_LAYERS + HCA_NUM_LAYERS == FWD_NUM_LAYERS, \
+    f"decode_fwd emits swa/csa/hca layers only, got ratios {FWD_COMPRESS_RATIOS}"
+assert (FWD_NUM_LAYERS - LEAD_NUM_LAYERS - 1) % 2 == 0, \
+    "decode_fwd expects two leading layers, strict pairs, and one trailing layer"
+assert LEAD_COMPRESS_RATIO in (SWA_COMPRESS_RATIO, HCA_COMPRESS_RATIO), \
+    f"decode_fwd leading layers must be swa or hca, got ratio {LEAD_COMPRESS_RATIO}"
+assert all(r == LEAD_COMPRESS_RATIO for r in FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS]), \
+    f"decode_fwd expects the first {LEAD_NUM_LAYERS} layers to have one attention kind"
+assert SWA_NUM_LAYERS == (LEAD_NUM_LAYERS if LEAD_COMPRESS_RATIO == SWA_COMPRESS_RATIO else 0), \
+    "decode_fwd supports swa only in the two leading layers"
 assert all(FWD_COMPRESS_RATIOS[LEAD_NUM_LAYERS + 2 * i] == CSA_COMPRESS_RATIO
            and FWD_COMPRESS_RATIOS[LEAD_NUM_LAYERS + 2 * i + 1] == HCA_COMPRESS_RATIO
            for i in range(PAIR_LOOP_COUNT)), \
@@ -131,6 +152,7 @@ assert FWD_COMPRESS_RATIOS[FWD_LAST_LAYER] == CSA_COMPRESS_RATIO, \
 # leading layer is csa.
 assert FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS].count(CSA_COMPRESS_RATIO) == 0, \
     "leading layers must not be csa; the loop indexes csa stacks with loop_i"
+
 
 CSA_LAYER_STACKED_NAMES = [
     "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape", "csa_cmp_norm_w", "csa_compress_state",
@@ -143,7 +165,7 @@ HCA_LAYER_STACKED_NAMES = [
 ]
 
 LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_b', 'wo_b_scale', 'wq_a', 'wq_b', 'wq_b_scale']
-SHARED_NAMES = ['x_hc', 'block_table', 'cmp_block_table', 'csa_cmp_slot_mapping', 'csa_compress_state_block_table', 'csa_idx_slot_mapping', 'csa_inner_compress_state_block_table', 'csa_inner_state_slot_mapping', 'csa_state_slot_mapping', 'freqs_cos', 'freqs_sin', 'hca_cmp_slot_mapping', 'hca_compress_state_block_table', 'hca_state_slot_mapping', 'idx_block_table', 'input_ids', 'kv_seq_lens', 'ori_slot_mapping', 'position_ids', 'swa_indices', 'swa_lens', 'swa_slot_mapping', 'window_swa_indices', 'window_swa_lens']
+SHARED_NAMES = ['block_table', 'cmp_block_table', 'csa_cmp_slot_mapping', 'csa_compress_state_block_table', 'csa_idx_slot_mapping', 'csa_inner_compress_state_block_table', 'csa_inner_state_slot_mapping', 'csa_state_slot_mapping', 'freqs_cos', 'freqs_sin', 'hca_cmp_slot_mapping', 'hca_compress_state_block_table', 'hca_state_slot_mapping', 'idx_block_table', 'input_ids', 'kv_seq_lens', 'ori_slot_mapping', 'position_ids', 'swa_indices', 'swa_lens', 'swa_slot_mapping', 'window_swa_indices', 'window_swa_lens']
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
 
@@ -176,6 +198,7 @@ RESIDENT_WEIGHT_NAMES = frozenset(
         if n not in CACHE_POOL_NAMES
     ]
     + ["freqs_cos", "freqs_sin"]
+    + ["embed_weight", "lm_head_weight"]
     + HC_HEAD_NAMES
     + FINAL_NORM_NAMES
 )
@@ -188,7 +211,7 @@ RESIDENT_CACHE_OUTPUT_NAMES = CACHE_POOL_NAMES
 
 @pl.jit(auto_scope=False)
 def decode_fwd(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -272,8 +295,12 @@ def decode_fwd(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -282,9 +309,15 @@ def decode_fwd(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pl.InOut[pld.DistributedTensor[[N_RANKS, 1], pl.INT32]],
+    lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
+    lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
+    x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    pack_x_hc(input_ids, embed_weight, x_hc)
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [0 * 3])
     hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [0 * MIX_HC])
@@ -369,20 +402,32 @@ def decode_fwd(
     x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
-        attention_hca(
-            x_hc,
-            hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
-            attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
-            wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
-            hca_cmp_wkv_l0, hca_cmp_wgate_l0, hca_cmp_ape_l0, hca_cmp_norm_w_l0,
-            hca_compress_state_l0, hca_compress_state_block_table,
-            kv_cache_l0, cmp_kv_l0, cmp_block_table,
-            ori_slot_mapping, window_swa_indices, window_swa_lens,
-            hca_cmp_slot_mapping, hca_state_slot_mapping,
-            position_ids, kv_seq_lens,
-            attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
-            x_attn0,
-        )
+        if LEAD_COMPRESS_RATIO == SWA_COMPRESS_RATIO:
+            attention_swa(
+                x_hc,
+                hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
+                attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
+                wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
+                kv_cache_l0,
+                swa_slot_mapping, swa_indices, swa_lens, position_ids,
+                attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
+                x_attn0,
+            )
+        else:
+            attention_hca(
+                x_hc,
+                hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
+                attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
+                wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
+                hca_cmp_wkv_l0, hca_cmp_wgate_l0, hca_cmp_ape_l0, hca_cmp_norm_w_l0,
+                hca_compress_state_l0, hca_compress_state_block_table,
+                kv_cache_l0, cmp_kv_l0, cmp_block_table,
+                ori_slot_mapping, window_swa_indices, window_swa_lens,
+                hca_cmp_slot_mapping, hca_state_slot_mapping,
+                position_ids, kv_seq_lens,
+                attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
+                x_attn0,
+            )
     with pl.scope():
         moe(
             x_attn0,
@@ -398,20 +443,32 @@ def decode_fwd(
             pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
-        attention_hca(
-            hidden,
-            hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
-            attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
-            wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
-            hca_cmp_wkv_l1, hca_cmp_wgate_l1, hca_cmp_ape_l1, hca_cmp_norm_w_l1,
-            hca_compress_state_l1, hca_compress_state_block_table,
-            kv_cache_l1, cmp_kv_l1, cmp_block_table,
-            ori_slot_mapping, window_swa_indices, window_swa_lens,
-            hca_cmp_slot_mapping, hca_state_slot_mapping,
-            position_ids, kv_seq_lens,
-            attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
-            x_attn1,
-        )
+        if LEAD_COMPRESS_RATIO == SWA_COMPRESS_RATIO:
+            attention_swa(
+                hidden,
+                hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
+                attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
+                wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
+                kv_cache_l1,
+                swa_slot_mapping, swa_indices, swa_lens, position_ids,
+                attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
+                x_attn1,
+            )
+        else:
+            attention_hca(
+                hidden,
+                hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
+                attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
+                wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
+                hca_cmp_wkv_l1, hca_cmp_wgate_l1, hca_cmp_ape_l1, hca_cmp_norm_w_l1,
+                hca_compress_state_l1, hca_compress_state_block_table,
+                kv_cache_l1, cmp_kv_l1, cmp_block_table,
+                ori_slot_mapping, window_swa_indices, window_swa_lens,
+                hca_cmp_slot_mapping, hca_state_slot_mapping,
+                position_ids, kv_seq_lens,
+                attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
+                x_attn1,
+            )
     with pl.scope():
         moe(
             x_attn1,
@@ -687,13 +744,20 @@ def decode_fwd(
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
         rms_norm(x_head, final_norm_w, x_out)
+        lm_head_with_sampling(
+            x_out, lm_head_weight, logit_row_indices, logits, sampled_ids,
+            lm_head_hidden_window, lm_head_hidden_done,
+            lm_head_logits_window, lm_head_logits_done,
+            my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
+            my_rank % LM_HEAD_TP_SIZE, LM_HEAD_COMM_EPOCH,
+        )
     return x_out
 
 
 
 @pl.jit.host
 def l3_decode_fwd(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    embed_weight: pl.Tensor[[N_RANKS, EMBED_VOCAB_DYN, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -777,10 +841,15 @@ def l3_decode_fwd(
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
+    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    embed_weight.bind_dynamic(1, EMBED_VOCAB_DYN)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
@@ -789,6 +858,10 @@ def l3_decode_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
+    lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
+    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -799,8 +872,12 @@ def l3_decode_fwd(
         data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+        lm_head_hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
+        lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         decode_fwd(
-            x_hc[r],
+            embed_weight[r],
             hc_attn_fn[r],
             hc_attn_scale[r],
             hc_attn_base[r],
@@ -884,10 +961,16 @@ def l3_decode_fwd(
             hc_head_scale[r],
             hc_head_base[r],
             final_norm_w[r],
+            lm_head_weight[r],
+            logit_row_indices[r],
             pre_hc_hidden_out[r],
             hidden_out[r],
+            logits[r],
+            sampled_ids[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
+            lm_head_hidden_window, lm_head_hidden_done,
+            lm_head_logits_window, lm_head_logits_done,
             r, num_tokens,
             device=r,
         )
@@ -987,6 +1070,7 @@ def make_forward_metadata_tensors(
     base_specs,
     start_pos=DECODE_START_POS,
     commit_tokens=1,
+    block_tables=None,
 ):
     import torch
     from decode_metadata import (
@@ -1008,7 +1092,7 @@ def make_forward_metadata_tensors(
     def physical_blocks_from_spec(name):
         shape = list(base_specs[name].shape)
         block_num_dim = shape[1] if shape[0] == N_RANKS else shape[0]
-        return block_num_dim // B
+        return block_num_dim
 
     hca_state_physical_blocks = physical_blocks_from_spec("hca_compress_state")
     csa_state_physical_blocks = physical_blocks_from_spec("csa_compress_state")
@@ -1045,7 +1129,16 @@ def make_forward_metadata_tensors(
     def init_kv_seq_lens_single():
         return kv_seq_lens_from_starts(init_start_pos(), seq=seq_per_batch, commit_tokens=commit_tokens)
 
-    def init_block_table_single(max_blocks, physical_blocks=None):
+    def init_block_table_single(name, max_blocks, physical_blocks=None):
+        if block_tables is not None and name in block_tables:
+            table = block_tables[name]
+            expected_shape = (B, max_blocks)
+            if tuple(table.shape) != expected_shape:
+                raise ValueError(
+                    f"block_tables[{name!r}] must have shape {expected_shape}, "
+                    f"got {tuple(table.shape)}"
+                )
+            return table.to(torch.int32).contiguous()
         return block_table(
             batch=B,
             table_blocks=max_blocks,
@@ -1055,21 +1148,21 @@ def make_forward_metadata_tensors(
     def init_ori_slot_mapping_single():
         return ori_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
-            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            init_block_table_single("block_table", ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
             block_size=BLOCK_SIZE,
         ).reshape(-1).contiguous()
 
     def init_swa_slot_mapping_single():
         return paged_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
-            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            init_block_table_single("block_table", ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
             block_size=BLOCK_SIZE,
         ).reshape(-1).contiguous()
 
     def init_swa_metadata_single():
         return swa_indices_and_lens(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
-            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            init_block_table_single("block_table", ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
             block_size=BLOCK_SIZE,
             window=win,
         )
@@ -1083,7 +1176,7 @@ def make_forward_metadata_tensors(
     def init_window_swa_metadata_single():
         return swa_indices_and_lens(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
-            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            init_block_table_single("block_table", ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
             block_size=BLOCK_SIZE,
             window=win,
         )
@@ -1094,48 +1187,44 @@ def make_forward_metadata_tensors(
     def init_window_swa_lens_single():
         return init_window_swa_metadata_single()[1].contiguous()
 
-    def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
+    def init_compressed_slot_mapping_single(name, compress_ratio, max_blocks, physical_blocks):
         positions = position_ids_from_starts(init_start_pos(), seq=seq_per_batch)
         return mask_uncommitted_compressed_boundaries(compressed_slot_mapping(
             positions,
-            init_block_table_single(max_blocks),
+            init_block_table_single(name, max_blocks, physical_blocks),
             compress_ratio=compress_ratio,
             block_size=BLOCK_SIZE,
         ), positions, compress_ratio=compress_ratio, commit_tokens=commit_tokens).reshape(-1).contiguous()
 
-    def init_state_block_table_single(max_blocks, physical_blocks):
-        return block_table(
-            batch=B,
-            table_blocks=max_blocks,
-            physical_blocks=physical_blocks,
-        )
+    def init_state_block_table_single(name, max_blocks, physical_blocks):
+        return init_block_table_single(name, max_blocks, physical_blocks)
 
-    def init_state_slot_mapping_single(max_blocks, block_size, physical_blocks):
+    def init_state_slot_mapping_single(name, max_blocks, block_size, physical_blocks):
         return state_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
-            init_state_block_table_single(max_blocks, physical_blocks),
+            init_state_block_table_single(name, max_blocks, physical_blocks),
             state_block_size=block_size,
         ).reshape(-1).contiguous()
 
     init_by_name = {
-        "block_table": lambda: ranked(lambda: init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS)),
-        "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS)),
-        "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS)),
-        "hca_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS, hca_state_physical_blocks)),
-        "csa_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS, csa_state_physical_blocks)),
-        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_INNER_STATE_MAX_BLOCKS, csa_inner_state_physical_blocks)),
+        "block_table": lambda: ranked(lambda: init_block_table_single("block_table", ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS)),
+        "cmp_block_table": lambda: ranked(lambda: init_block_table_single("cmp_block_table", CSA_CMP_MAX_BLOCKS, CSA_CMP_BLOCK_NUM)),
+        "idx_block_table": lambda: ranked(lambda: init_block_table_single("idx_block_table", CSA_IDX_CACHE_MAX_BLOCKS, CSA_IDX_CACHE_BLOCK_NUM)),
+        "hca_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single("hca_compress_state_block_table", HCA_COMPRESS_STATE_MAX_BLOCKS, hca_state_physical_blocks)),
+        "csa_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single("csa_compress_state_block_table", CSA_MAIN_STATE_MAX_BLOCKS, csa_state_physical_blocks)),
+        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single("csa_inner_compress_state_block_table", CSA_INNER_STATE_MAX_BLOCKS, csa_inner_state_physical_blocks)),
         "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
         "swa_slot_mapping": lambda: ranked(init_swa_slot_mapping_single),
         "swa_indices": lambda: ranked(init_swa_indices_single),
         "swa_lens": lambda: ranked(init_swa_lens_single),
         "window_swa_indices": lambda: ranked(init_window_swa_indices_single),
         "window_swa_lens": lambda: ranked(init_window_swa_lens_single),
-        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
-        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
-        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS)),
-        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE, hca_state_physical_blocks)),
-        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE, csa_state_physical_blocks)),
-        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE, csa_inner_state_physical_blocks)),
+        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single("cmp_block_table", HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS, CSA_CMP_BLOCK_NUM)),
+        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single("cmp_block_table", CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS, CSA_CMP_BLOCK_NUM)),
+        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single("idx_block_table", CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS, CSA_IDX_CACHE_BLOCK_NUM)),
+        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single("hca_compress_state_block_table", HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE, hca_state_physical_blocks)),
+        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single("csa_compress_state_block_table", CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE, csa_state_physical_blocks)),
+        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single("csa_inner_compress_state_block_table", CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE, csa_inner_state_physical_blocks)),
         "position_ids": lambda: ranked(init_position_ids_single),
         "kv_seq_lens": lambda: ranked(init_kv_seq_lens_single),
     }
@@ -1391,16 +1480,37 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
+
+    def init_lm_head_weight():
+        shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
+
+    def init_logit_row_indices():
+        active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
+        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices[:, :active] = torch.arange(active, dtype=torch.int32)
+        return indices
+
     base_specs = {
         spec.name: spec
         for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0)
         if isinstance(spec, TensorSpec)
     }
     metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'window_swa_indices', 'window_swa_lens', 'swa_slot_mapping', 'swa_indices', 'swa_lens', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
+    ordered_names = ['embed_weight', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'window_swa_indices', 'window_swa_lens', 'swa_slot_mapping', 'swa_indices', 'swa_lens', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []
     for name in ordered_names:
-        if name in metadata_specs:
+        if name == "embed_weight":
+            embed_weight = torch.randn(MODEL_CONFIG.vocab_size, D, dtype=torch.bfloat16)
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, MODEL_CONFIG.vocab_size, D],
+                torch.bfloat16,
+                init_value=lambda value=embed_weight: value.unsqueeze(0).expand(
+                    N_RANKS, -1, -1
+                ).contiguous(),
+            ))
+        elif name in metadata_specs:
             specs.append(metadata_specs[name])
         elif name in CSA_LAYER_STACKED_NAMES:
             specs.append(_make_layer_stacked_spec(name, base_specs, CSA_NUM_LAYERS))
@@ -1426,16 +1536,49 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in CACHE_POOL_NAMES:
             spec.resident = "stacked"
 
+    specs.append(TensorSpec(
+        "lm_head_weight",
+        [N_RANKS, VOCAB_PER_TP, D],
+        torch.bfloat16,
+        init_value=init_lm_head_weight,
+        resident="stacked",
+    ))
+    specs.append(TensorSpec(
+        "logit_row_indices",
+        [N_RANKS, MAX_LOGIT_ROWS],
+        torch.int32,
+        init_value=init_logit_row_indices,
+    ))
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec(
+        "logits",
+        [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
+        torch.float32,
+        is_output=True,
+    ))
+    specs.append(TensorSpec(
+        "sampled_ids",
+        [N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD],
+        torch.int32,
+        is_output=True,
+    ))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepSeek-V4 Pro packed single-token decode forward driver.")
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 Pro/Flash packed decode forward driver.")
+    parser.add_argument(
+        "--variant",
+        choices=SUPPORTED_VARIANTS,
+        default=ACTIVE_VARIANT,
+        help="Architecture preset selected before module import (default: pro).",
+    )
+    # This full multi-card forward is device-only (see ``ci: no-sim`` above).
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
+    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16], help="LM-head TP group size")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument(
         "--start-pos",
@@ -1453,6 +1596,7 @@ def main():
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+    assert args.tp == LM_HEAD_TP_SIZE and N_RANKS % args.tp == 0
 
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
 
@@ -1473,6 +1617,8 @@ def main():
             enable_scope_stats=args.enable_scope_stats,
         ),
     )
+    if result.work_dir is not None:
+        print(f"[RUN] runtime_dir={result.work_dir.resolve()}", flush=True)
     if not result.passed:
         if result.error:
             print(result.error)

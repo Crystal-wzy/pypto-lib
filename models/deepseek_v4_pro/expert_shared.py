@@ -21,7 +21,7 @@ amax+rescale of the same tokens.
 
 import pypto.language as pl
 
-from config import (PRO_KERNEL as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
+from config import (ACTIVE as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
 # model config
@@ -49,20 +49,12 @@ INTER_K = 512
 MM_INTER_TILE = 256
 ACT_INTER_TILE = 1024
 D_OUT_TILE = 256
-# h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
-# MUST divide MOE_INTER: the quant loop is `pl.pipeline(0, MOE_INTER // QUANT_TILE)`,
-# so a non-dividing tile silently truncates the trip count and leaves the tail of
-# h_tile_i8 unwritten -- w2 then reduces over garbage. PRO's MOE_INTER is 3072
-# (FLASH: 2048), which 2048 does not divide; 1024 does, and is still 2 cache lines.
-QUANT_TILE = 1024
+# The quant loop requires an exact divisor of MOE_INTER. Preserve the existing
+# Flash and Pro tile choices while sharing the implementation.
+QUANT_TILE = 2048 if M.name == "flash" else 1024
 D_OUT_TILE_ACT = 512
-# 14 (not 8): the w2-dequant task count is `D // (W2_ACT_INNER * D_OUT_TILE_ACT)`.
-# For FLASH that was 4096 // 4096 == 1 task covering all of D. PRO's D = 7168 is
-# NOT a multiple of 8 * 512 = 4096, so the same expression truncates to 1 task
-# covering only 4096 columns and silently leaves 3072 columns of D un-dequantized.
-# W2_ACT_INNER must divide D // D_OUT_TILE_ACT (= 14 for PRO); 14 keeps the single
-# outer task FLASH had and moves the whole range into the inner pipeline.
-W2_ACT_INNER = 14
+# Keep one w2-dequant task covering the architecture's full hidden dimension.
+W2_ACT_INNER = 8 if M.name == "flash" else 14
 
 # Every tile that is used as `<dim> // <tile>` in a loop bound must divide its dim
 # exactly, otherwise the loop silently covers only part of the tensor.

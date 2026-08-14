@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import (PRO_KERNEL as M, MOE_TOKENS, FP32_NEG_INF,
+from config import (ACTIVE as M, MOE_TOKENS, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
@@ -20,7 +20,7 @@ T = MOE_TOKENS
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
 # Routing space: every rank routes over the full global expert set so dispatch
-# can fan tokens across ranks. moe.py shrinks config.PRO_KERNEL.n_routed_experts to
+# can fan tokens across ranks. moe.py shrinks config.ACTIVE.n_routed_experts to
 # 32*EP before importing this module, so N_EXPERTS follows the active EP world.
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
@@ -39,43 +39,65 @@ D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
-# 512 (not 2048) because PRO's D = 7168 is not a multiple of 2048. 512 -- rather
-# than 1024 -- because the K-loop below is a pl.pipeline(stage=2) over a
-# loop-carried L0C accumulator: 7168/1024 = 7 is ODD, which makes codegen emit an
-# acc->acc pto.tmov that A5 does not implement (ptoas: "'pto.tmov' op expects a
-# supported tmov address-space pair for this target"). 7168/512 = 14 is even.
-GATE_D_TILE = 512
+# Flash uses two 2048-wide K tiles. Pro uses 512 because D=7168 is not a
+# multiple of 2048; the resulting 14 trips also keep the stage-2 accumulator
+# pipeline even and avoid an unsupported acc-to-acc tmov.
+GATE_D_TILE = 2048 if M.name == "flash" else 512
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 assert (D // GATE_D_TILE) % 2 == 0, "gate K-loop trip count must be even (stage=2 acc pipeline)"
 QUANT_TILE = 256
-# Padded expert row for sort32 + mrgsort: the next power of two >= N_EXPERTS.
-# MUST be >= N_EXPERTS -- the score buffers are [T_PAD, SCORE_PAD] and the topk
-# runs over that width, so a SCORE_PAD below N_EXPERTS silently drops the tail
-# experts from routing. FLASH's 256 experts landed on exactly 256; PRO has 384,
-# which needs 512 (the 128-wide remainder is -inf filled below).
 # Padded expert row for sort32 + mrgsort.
 #
 # MUST be >= N_EXPERTS: the score buffers are [T_PAD, SCORE_PAD] and the topk runs
-# over that width, so a SCORE_PAD below N_EXPERTS silently drops the tail experts
-# from routing. FLASH's 256 experts landed on exactly 256; PRO has 384.
-#
-# Pinned to 512 rather than "next power of two >= N_EXPERTS" so the merge chain in
-# route_sort stays a single fixed shape. The chain is: sort32 emits [1, 2*SCORE_PAD]
-# (value, index) pairs in runs of 64 -> mrgsort format1 merges those 4-at-a-time into
-# runs of 256 -> one format2 merge folds those into a single run. At SCORE_PAD 512
-# that last step is always 4-way. Making it depend on N_EXPERTS would need a Python
-# `if` inside the kernel, and the DSL parser walks *both* branches, so `sr_sorted`
-# would be assigned two different shapes ("Cannot reassign 'sr_sorted' with a
-# different type"). moe.py shrinks N_EXPERTS to 32*EP; those rows just carry more
-# -inf padding (filled below), which costs a little sort work but stays correct.
-SCORE_PAD = 512
+# over that width. Flash fits 256 exactly; Pro's 384 experts need 512.
+SCORE_PAD = 256 if M.name == "flash" else 512
 assert SCORE_PAD >= N_EXPERTS, (
     f"SCORE_PAD ({SCORE_PAD}) must cover every routed expert (N_EXPERTS={N_EXPERTS})"
 )
-assert SCORE_PAD == 512, "route_sort's final mrgsort is hard-wired 4-way over 4 runs of 256"
+assert SCORE_PAD in (256, 512)
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
+
+
+if M.name == "flash":
+    @pl.jit.inline
+    def route_topk_row(
+        score_row: pl.Tensor[[1, 256], pl.FP32],
+    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
+        """Sort one Flash router row and return its leading expert ids."""
+
+        idx_init = pl.arange(0, [1, 256], dtype=pl.UINT32)
+        sorted_pairs = pl.sort32(score_row, idx_init)
+        sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
+        sorted_pairs = pl.mrgsort(sorted_pairs[:, 0:256], sorted_pairs[:, 256:512])
+        return pl.gather(
+            sorted_pairs[:, 0:SORT_PAD],
+            mask_pattern=pl.tile.MaskPattern.P1010,
+            output_dtype=pl.INT32,
+        )
+else:
+    @pl.jit.inline
+    def route_topk_row(
+        score_row: pl.Tensor[[1, 512], pl.FP32],
+    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
+        """Sort one Pro router row and return its leading expert ids."""
+
+        idx_init = pl.arange(0, [1, 512], dtype=pl.UINT32)
+        sorted_pairs = pl.sort32(score_row, idx_init)
+        sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
+        sorted_pairs = pl.mrgsort(
+            sorted_pairs[:, 0:256],
+            sorted_pairs[:, 256:512],
+            sorted_pairs[:, 512:768],
+            sorted_pairs[:, 768:1024],
+        )
+        return pl.gather(
+            sorted_pairs[:, 0:SORT_PAD],
+            mask_pattern=pl.tile.MaskPattern.P1010,
+            output_dtype=pl.INT32,
+        )
+
 
 @pl.jit.inline
 def gate(
@@ -264,47 +286,48 @@ def gate(
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
-            # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
-            # the batched pl.gather below accepts it — Tile-against-Tensor src
-            # is rejected.
-            topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
-            # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
-            # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+            # row-by-row. route_topk_row is selected at module import for the
+            # active preset's concrete 256- or 512-wide merge layout.
+            topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             for sr_tt in pl.range(GATE_T_TILE):
-                sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
-                sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-                sr_sorted = pl.sort32(sr_row, sr_idx_init)
-                sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                # format2 4-way: SCORE_PAD=512 -> sort32 gives [1, 1024] = 4 runs of
-                # 256 after format1, folded here into one sorted run of 1024.
-                sr_sorted = pl.mrgsort(
-                    sr_sorted[:, 0:256],
-                    sr_sorted[:, 256:512],
-                    sr_sorted[:, 512:768],
-                    sr_sorted[:, 768:1024],
+                sr_row = pl.slice(
+                    biased_scores_buf,
+                    [1, SCORE_PAD],
+                    [t1 + sr_tt, 0],
                 )
-                sr_pairs = sr_sorted[:, 0:SORT_PAD]
-                sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                sr_i = route_topk_row(sr_row)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
-            # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
-            # tail so the normalize sum below sees only real TOPK entries.
+
+            # Keep the gather and normalization batched: one-row col-major
+            # tiles violate the 32-byte column alignment required by PTOAS.
             local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
             local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
             gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
             gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
             topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            # Copy topk_idx_tile to dodge the tensor_view-vs-ptr SSA conflict
-            # between sort's slice-assign and scalar pl.read (pypto #1493).
+            # Copy to avoid mixing a tensor view with scalar reads from the same
+            # SSA value after the gather.
             topk_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             topk_idx_read[:, :] = topk_idx_tile[:, :]
-            nm_denom = pl.reshape(pl.row_sum(topk_vals_pad), [GATE_T_TILE, 1])
-            nm_weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, nm_denom), ROUTE_SCALE)
-            for nm_tt in pl.range(GATE_T_TILE):
-                if t1 + nm_tt < active_tokens:
-                    for nm_k in pl.range(TOPK):
-                        pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
-                        pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
+            denom = pl.reshape(pl.row_sum(topk_vals_pad), [GATE_T_TILE, 1])
+            normalized_weights = pl.mul(
+                pl.row_expand_div(topk_vals_pad, denom),
+                ROUTE_SCALE,
+            )
+            for wt_tt in pl.range(GATE_T_TILE):
+                if t1 + wt_tt < active_tokens:
+                    for wt_k in pl.range(TOPK):
+                        pl.write(
+                            indices,
+                            [t1 + wt_tt, wt_k],
+                            pl.read(topk_idx_read, [wt_tt, wt_k]),
+                        )
+                        pl.write(
+                            weights,
+                            [t1 + wt_tt, wt_k],
+                            pl.read(normalized_weights, [wt_tt, wt_k]),
+                        )
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value. weights is convenient because it's already pl.Out and reads as

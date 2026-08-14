@@ -14,7 +14,7 @@ import pypto.language as pl
 from golden import mapped_pool_ratio_allclose
 
 from config import (
-    PRO_KERNEL as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,

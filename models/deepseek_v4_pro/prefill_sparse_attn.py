@@ -17,7 +17,7 @@ import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
-    PRO_KERNEL as M,
+    ACTIVE as M,
     FP32_NEG_INF,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,

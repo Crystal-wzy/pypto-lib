@@ -13,7 +13,7 @@ import pypto.language as pl
 from config import (
     BLOCK_SIZE,
     CSA_STATE_PHYSICAL_BLOCKS,
-    PRO_KERNEL as M,
+    ACTIVE as M,
     FP32_NEG_INF,
     PREFILL_CMP_BLOCK_NUM,
 )

@@ -17,7 +17,7 @@ import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
-    PRO_KERNEL as M,
+    ACTIVE as M,
     HCA_STATE_PHYSICAL_BLOCKS,
     PREFILL_BATCH,
     PREFILL_SEQ,

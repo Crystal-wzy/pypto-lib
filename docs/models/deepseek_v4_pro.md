@@ -1,14 +1,14 @@
 # DeepSeek V4-Pro
 
-`models/deepseek_v4_pro/` is the Ascend 950 (A5) variant: the same V4 operator
-set and compositions as [V4-Flash](deepseek_v4_flash_mtp.md), built for the
-larger **DeepSeek-V4-Pro** checkpoint.
+`models/deepseek_v4_pro/` is the Ascend 950 (A5) implementation for DeepSeek-V4
+Pro, with an optional Flash architecture preset. Select the preset at import
+and compile time with `DEEPSEEK_V4_VARIANT=pro|flash` or `--variant pro|flash`.
 
 ## Deployment configuration
 
-The `PRO` preset in [config.py](../../models/deepseek_v4_pro/config.py) mirrors
-the HuggingFace model's `config.json`; the kernels import `PRO_KERNEL`, which
-is the same architecture at a shorter sequence budget.
+The `PRO` and `FLASH` presets in [config.py](../../models/deepseek_v4_pro/config.py)
+define the architecture-specific shapes and layer schedules. Pro remains the
+default so existing operator entry points and DailyCI keep their prior behavior.
 
 | Deployment property | Value |
 | --- | --- |
@@ -16,7 +16,7 @@ is the same architecture at a shorter sequence budget.
 | Decode batch per card | 4 requests → 8 token rows per step |
 | Decode context length | up to 16,384 positions (`KERNEL_MAX_SEQ_LEN`), 128-token pages |
 | Prefill shape | one request of 128 tokens per program |
-| Platform | Ascend A5 (`-p a5`); the parsers also accept A2/A3 and both simulators |
+| Platform | Ascend A5 (`-p a5`); full forwards are device-only |
 | Expert parallelism | `--ep 2/4/8`, `384 / ep` routed experts per rank |
 | LM-head parallelism | `--tp 2/4/8` vocab shards; `LM_HEAD_TP_SIZE = 8` is the deployment value |
 | Other components | no tensor parallelism — attention is data-parallel, MoE is expert-parallel |
@@ -74,9 +74,9 @@ prefill_fwd    same schedule with prefill_attention_{hca,csa} → moe,
                tail               hc_head → rms_norm
 ```
 
-Both forwards stop at the final norm: unlike the Flash tree, the LM head is not
-part of them. [lm_head.py](../../models/deepseek_v4_pro/lm_head.py) is a
-standalone distributed harness here.
+Both forwards finish with the final norm and LM-head sampling. The standalone
+[lm_head.py](../../models/deepseek_v4_pro/lm_head.py) entry point validates that
+distributed tail separately.
 
 ### One layer
 

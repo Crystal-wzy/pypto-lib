@@ -15,7 +15,7 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 
 import pypto.language as pl
 
-from config import (PRO_KERNEL as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
+from config import (ACTIVE as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
                     EP_WORLD_SIZE, RECV_MAX)
 
 
@@ -44,8 +44,8 @@ D_OUT_TILE = 256
 QUANT_TILE = 512
 D_OUT_TILE_ACT = 512
 W2_INNER = 4
-# Pro has 14 512-column dequant tiles; one task must cover all of them.
-W2_ACT_INNER = 14
+# One task covers the architecture's full hidden dimension.
+W2_ACT_INNER = 8 if M.name == "flash" else 14
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"

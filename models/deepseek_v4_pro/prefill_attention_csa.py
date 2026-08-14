@@ -21,7 +21,7 @@ import os
 import pypto.language as pl
 
 from config import (
-    PRO_KERNEL as M,
+    ACTIVE as M,
     BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     CSA_STATE_PHYSICAL_BLOCKS,

@@ -12,7 +12,7 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import PRO_KERNEL as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import ACTIVE as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # Dynamic shape variables.

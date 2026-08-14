@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (
-    PRO_KERNEL as M,
+    ACTIVE as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,

@@ -14,7 +14,7 @@ Softmax+pool over all slots. No state shift needed."""
 import pypto.language as pl
 
 from config import (
-    PRO_KERNEL as M,
+    ACTIVE as M,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
