@@ -1,6 +1,7 @@
 name: Daily CI
 
 on:
+  push:
   schedule:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
